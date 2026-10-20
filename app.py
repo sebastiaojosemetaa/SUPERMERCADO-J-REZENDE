@@ -1,0 +1,3366 @@
+import streamlit as st
+import streamlit.components.v1 as components
+import sqlite3
+import pandas as pd
+import base64
+from datetime import datetime, date, timedelta
+from reportlab.lib.pagesizes import letter
+from reportlab.lib import colors
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+import io
+import datetime as dt
+import hashlib
+import uuid
+
+# -----------------------------------------------------------------------------
+# CONFIGURAÇÃO DA PÁGINA
+# -----------------------------------------------------------------------------
+st.set_page_config(page_title="CRM Comércio - Rey da Cebola", layout="wide", page_icon="🛍️")
+
+# =========================================================
+# IDENTIFICADOR ÚNICO POR NAVEGADOR / APARELHO
+# =========================================================
+if "device_id" not in st.query_params:
+    st.query_params["device_id"] = str(uuid.uuid4())
+device_id = st.query_params["device_id"]
+
+# =========================================================
+# FUNÇÃO: GERADOR DE CHAVE ÚNICA POR CNPJ / CPF
+# =========================================================
+def gerar_chave_por_documento(documento):
+    apenas_digitos = ''.join(filter(str.isdigit, str(documento)))
+    segredo_mestre = "REY_CEBOLA_2026"
+    combinado = apenas_digitos + segredo_mestre
+    hash_hex = hashlib.md5(combinado.encode()).hexdigest().upper()
+    chave_formatada = f"CRM-{hash_hex[:4]}-{hash_hex[:8][-4:]}-{hash_hex[8:12]}" # Mantém o padrão de formato
+    return f"CRM-{hash_hex[:4]}-{hash_hex[4:8]}-{hash_hex[8:12]}"
+
+# =========================================================
+# PAINEL DO DESENVOLVEDOR (SEMPRE VISÍVEL NA BARRA LATERAL)
+# =========================================================
+with st.sidebar.expander("🛠️ Gerador de Chaves (Dev)"):
+    senha_dev = st.text_input("Senha Mestre Dev", type="password", key="pwd_dev_topo_unico")
+    if senha_dev == "13142715":  # Sua senha mestre
+        doc_cliente = st.text_input("CNPJ ou CPF do Cliente:", key="doc_dev_topo_doc_unico")
+        if st.button("🔑 Gerar Chave", key="btn_dev_topo_acao_unico"):
+            if doc_cliente.strip():
+                doc_limpo = ''.join(filter(str.isdigit, str(doc_cliente)))
+                chave_gerada = gerar_chave_por_documento(doc_limpo)
+                st.code(chave_gerada, language="text")
+                st.success("Chave gerada com sucesso!")
+            else:
+                st.warning("Digite um CNPJ ou CPF.")
+
+st.sidebar.markdown("---")
+
+# =========================================================
+# CONEXÃO E TABELAS MULTI-EMPRESA
+# =========================================================
+def get_connection():
+    return sqlite3.connect("crm_comercio.db", check_same_thread=False)
+
+conn = get_connection()
+
+def inicializar_tabelas_multiempresas():
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS empresas_dispositivos (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            device_id TEXT UNIQUE,
+            nome_empresa TEXT,
+            cnpj TEXT,
+            ie TEXT,
+            fone TEXT,
+            endereco TEXT
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS dispositivo_licenca (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            device_id TEXT UNIQUE,
+            chave TEXT,
+            data_expiracao DATETIME,
+            status TEXT
+        )
+    """)
+    conn.commit()
+
+inicializar_tabelas_multiempresas()
+
+# -----------------------------------------------------------------------------
+# 1. VERIFICA A EMPRESA DESTE DISPOSITIVO ESPECÍFICO
+# -----------------------------------------------------------------------------
+df_emp_dev = pd.read_sql_query(
+    "SELECT * FROM empresas_dispositivos WHERE device_id = ?", 
+    conn, 
+    params=(device_id,)
+)
+
+empresa_registrada = not df_emp_dev.empty and bool(str(df_emp_dev.iloc[0].get('cnpj', '')).strip())
+
+if not empresa_registrada:
+    st.markdown("## 🏢 Bem-vindo! Cadastre os Dados da sua Empresa")
+    st.warning("⚠️ Este dispositivo/navegador ainda não tem uma empresa configurada. Insira os seus dados abaixo.")
+    
+    with st.form("form_config_inicial_empresa_dev"):
+        c_nome = st.text_input("Nome / Razão Social")
+        c_cnpj = st.text_input("CNPJ ou CPF")
+        c_ie = st.text_input("Inscrição Estadual (IE)")
+        c_tel = st.text_input("Telefone de Contato")
+        c_end = st.text_input("Endereço Completo")
+        
+        btn_salvar_emp = st.form_submit_button("💾 Salvar Dados e Ir para Ativação", type="primary")
+        if btn_salvar_emp:
+            if c_nome.strip() and c_cnpj.strip():
+                cnpj_limpo = ''.join(filter(str.isdigit, c_cnpj))
+                cursor = conn.cursor()
+                cursor.execute("""
+                    INSERT OR REPLACE INTO empresas_dispositivos (device_id, nome_empresa, cnpj, ie, fone, endereco)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, (device_id, c_nome.strip(), cnpj_limpo, c_ie.strip(), c_tel.strip(), c_end.strip()))
+                conn.commit()
+                st.success("Empresa cadastrada com sucesso para este dispositivo!")
+                st.rerun()
+            else:
+                st.error("Preencha o Nome e o CNPJ/CPF.")
+    st.stop()
+
+cnpj_registrado = df_emp_dev.iloc[0]['cnpj']
+nome_empresa_registrada = df_emp_dev.iloc[0]['nome_empresa']
+
+# -----------------------------------------------------------------------------
+# 2. VERIFICA A LICENÇA DESTE DISPOSITIVO ESPECÍFICO
+# -----------------------------------------------------------------------------
+df_lic = pd.read_sql_query(
+    "SELECT * FROM dispositivo_licenca WHERE device_id = ? AND status = 'ATIVADO'", 
+    conn, 
+    params=(device_id,)
+)
+
+dispositivo_ativado = False
+if not df_lic.empty:
+    data_exp = pd.to_datetime(df_lic.iloc[0]['data_expiracao'])
+    if data_exp > datetime.now():
+        dispositivo_ativado = True
+
+if not dispositivo_ativado:
+    st.markdown("## 🔐 Ativação de Licença do Dispositivo")
+    st.info(f"Empresa: **{nome_empresa_registrada}** (CNPJ/CPF: **{cnpj_registrado}**)")
+    
+    chave_digitada = st.text_input("🔑 Chave de Ativação:", type="password", placeholder="Digite a sua chave...", key="input_chave_ativacao_tela")
+    
+    if st.button("🔓 Ativar Este Dispositivo", type="primary", key="btn_ativar_dispositivo_tela"):
+        chave_limpa = chave_digitada.strip().upper()
+        cnpj_limpo_bd = ''.join(filter(str.isdigit, str(cnpj_registrado)))
+        chave_esperada = gerar_chave_por_documento(cnpj_limpo_bd)
+        CHAVE_MESTRE = "CRM-REYSAL-MESTRE"
+        
+        if chave_limpa == chave_esperada or chave_limpa == CHAVE_MESTRE:
+            nova_exp = (datetime.now() + timedelta(days=365)).strftime('%Y-%m-%d %H:%M:%S')
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT OR REPLACE INTO dispositivo_licenca (device_id, chave, data_expiracao, status)
+                VALUES (?, ?, ?, 'ATIVADO')
+            """, (device_id, chave_limpa, nova_exp))
+            conn.commit()
+            st.success("Dispositivo ativado com sucesso!")
+            st.rerun()
+        else:
+            st.error("Chave inválida para este CNPJ.")
+    st.stop()
+
+dias_disp = 365
+st.sidebar.caption(f"🟢 **Dispositivo Ativado** ({dias_disp} dias de acesso)")
+# =========================================================
+# ESTILO VISUAL METÁLICO/CLÁSSICO PDV (FÊNIX STYLE)
+# =========================================================
+estilo_pdv_fenix = """
+<style>
+    .stApp {
+        background: linear-gradient(135deg, #e0e0e0 0%, #b0b0b0 100%) !important;
+        color: #000000 !important;
+    }
+    div[data-testid="stVerticalBlock"] > div {
+        background-color: #d8d8d8;
+        border: 2px solid #a6a6a6;
+        border-radius: 12px;
+        padding: 12px;
+        box-shadow: inset 1px 1px 3px #ffffff, 3px 3px 8px rgba(0,0,0,0.2);
+    }
+    div[data-baseweb="input"] {
+        background-color: #ffffff !important;
+        border: 2px solid #888888 !important;
+        border-radius: 8px !important;
+    }
+    div[data-baseweb="input"] input {
+        color: #000000 !important;
+        font-weight: bold !important;
+        font-size: 16px !important;
+    }
+    label, p, h1, h2, h3, h4, span {
+        color: #111111 !important;
+        font-weight: bold !important;
+    }
+    div[data-testid="stTable"], div[data-testid="stDataFrame"] {
+        background-color: #ffffff !important;
+        border-radius: 8px !important;
+        border: 1px solid #999999 !important;
+    }
+    button[kind="primary"] {
+        background-color: #008000 !important;
+        color: #ffffff !important;
+        font-size: 18px !important;
+        font-weight: bold !important;
+        border-radius: 8px !important;
+    }
+</style>
+"""
+st.markdown(estilo_pdv_fenix, unsafe_allow_html=True)
+
+def adequar_banco_e_migrar():
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS produtos (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                produto TEXT
+            )
+        """)
+        
+        colunas_produtos = [
+            "fornecedor", "grupo", "preco_compra", "preco_venda", 
+            "venda", "quantidade", "estoque", "codigo"
+        ]
+        for col in colunas_produtos:
+            try:
+                cursor.execute(f"ALTER TABLE produtos ADD COLUMN {col} TEXT")
+            except Exception:
+                pass
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS clientes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                cliente TEXT
+            )
+        """)
+        colunas_clientes = [
+            "cliente", "nome", "cpf", "doc", "endereco", 
+            "email", "fone", "telefone", "cidade", "senha"
+        ]
+        for col in colunas_clientes:
+            try:
+                cursor.execute(f"ALTER TABLE clientes ADD COLUMN {col} TEXT")
+            except Exception:
+                pass
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS vendas (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                cliente TEXT,
+                produto TEXT,
+                data TEXT
+            )
+        """)
+        colunas_vendas = [
+            "fornecedor", "grupo", "quantidade", "valor_venda", 
+            "valor_total", "forma_pagamento", "valor_recebido", 
+            "troco", "restante", "status", "tipo", "codigo", "codigo_venda"
+        ]
+        for col in colunas_vendas:
+            try:
+                cursor.execute(f"ALTER TABLE vendas ADD COLUMN {col} TEXT")
+            except Exception:
+                pass
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS caixa_sessoes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                data_abertura TEXT,
+                data_fechamento TEXT,
+                saldo_inicial REAL,
+                saldo_final REAL,
+                status TEXT
+            )
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS caixa_movimentacoes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sessao_id INTEGER,
+                tipo TEXT,
+                valor REAL,
+                descricao TEXT,
+                data TEXT
+            )
+        """)
+
+        conn.commit()
+    except Exception as e:
+        print(f"Aviso de migração: {e}")
+
+adequar_banco_e_migrar()
+
+def carregar_dados(query):
+    try:
+        return pd.read_sql_query(query, conn)
+    except Exception:
+        return pd.DataFrame()
+
+def carregar_coluna(tabela, coluna):
+    cursor = conn.cursor()
+    try:
+        cursor.execute(f"PRAGMA table_info({tabela})")
+        cols = [col[1] for col in cursor.fetchall()]
+        col_alvo = coluna if coluna in cols else (cols[1] if len(cols) > 1 else coluna)
+        
+        df = carregar_dados(f"SELECT DISTINCT TRIM({col_alvo}) as {col_alvo} FROM {tabela} WHERE {col_alvo} IS NOT NULL AND {col_alvo} != ''")
+        if not df.empty:
+            return df[col_alvo].tolist()
+    except Exception:
+        pass
+    return []
+
+# -----------------------------------------------------------------------------
+# NAVEGAÇÃO E PERFIL DE ACESSO (BARRA LATERAL)
+# -----------------------------------------------------------------------------
+if 'admin_logged' not in st.session_state:
+    st.session_state.admin_logged = False
+
+if 'cliente_autenticado' not in st.session_state:
+    st.session_state.cliente_autenticado = None
+
+if 'carrinho_pdv' not in st.session_state:
+    st.session_state.carrinho_pdv = []
+
+st.sidebar.title("🔑 Acesso ao Sistema")
+opcoes_perfil = ["👤 Portal do Cliente", "🔒 Administração / Vendedor"]
+perfil_selecionado = st.sidebar.radio("Selecione o Perfil:", opcoes_perfil, key="perfil_principal_radio_v2")
+st.sidebar.markdown("---")
+
+# ==========================================
+# AMBIENTE 1: PORTAL DO CLIENTE
+# ==========================================
+if perfil_selecionado == "👤 Portal do Cliente":
+    if not st.session_state.cliente_autenticado:
+        st.title("🔒 Portal do Cliente")
+        st.info("Por favor, selecione o seu nome no menu lateral e insira a sua senha para aceder aos seus pedidos.")
+        
+        df_cli_select = carregar_dados("SELECT * FROM clientes")
+        lista_clientes = []
+        
+        if not df_cli_select.empty:
+            df_cli_select.columns = [c.lower() for c in df_cli_select.columns]
+            for col_cand in ['cliente', 'nome', 'razao_social']:
+                if col_cand in df_cli_select.columns:
+                    vals = df_cli_select[col_cand].dropna().astype(str).str.strip()
+                    lista_clientes.extend(vals[vals != ''].unique().tolist())
+            lista_clientes = list(dict.fromkeys(lista_clientes))
+    
+        if not lista_clientes:
+            lista_clientes = ["Carlos Alberto"]
+        
+        cliente_nome = st.sidebar.selectbox("Identifique o seu Nome/Empresa:", lista_clientes, key="sb_cli_nome_login")
+        senha_cliente = st.sidebar.text_input("Digite a sua Senha:", type="password", key="inp_cli_senha_login")
+        
+        if st.sidebar.button("Acessar Meus Pedidos", key="btn_login_cli_acao"):
+            senha_cadastrada = "123"
+            if not df_cli_select.empty:
+                for _, r in df_cli_select.iterrows():
+                    nome_reg = ""
+                    for col_c in ['cliente', 'nome', 'razao_social']:
+                        if col_c in df_cli_select.columns and pd.notna(r[col_c]):
+                            nome_reg = str(r[col_c]).strip()
+                            break
+                    if nome_reg.upper() == cliente_nome.strip().upper():
+                        if pd.notna(r.get('senha')) and str(r.get('senha')).strip() != "":
+                            senha_cadastrada = str(r['senha']).strip()
+                        break
+            
+            if senha_cliente == senha_cadastrada:
+                st.session_state.cliente_autenticado = cliente_nome
+                st.rerun()
+            else:
+                st.sidebar.error("Senha incorreta!")
+    else:
+        st.sidebar.success(f"Logado como:\n**{st.session_state.cliente_autenticado}**")
+        if st.sidebar.button("Sair / Trocar Cliente", key="btn_sair_cli_sessao"):
+            st.session_state.cliente_autenticado = None
+            st.rerun()
+            
+        st.title(f"🛍️ Portal do Cliente — Meus Pedidos ({st.session_state.cliente_autenticado})")
+
+        try:
+            cursor = conn.cursor()
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS pedidos (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    cliente TEXT,
+                    produto TEXT,
+                    quantidade REAL,
+                    valor_unitario REAL,
+                    valor_total REAL,
+                    fornecedor TEXT,
+                    grupo TEXT,
+                    data TEXT,
+                    status TEXT,
+                    codigo_pedido TEXT
+                )
+            """)
+            conn.commit()
+        except Exception:
+            pass
+    
+        aba_novo, aba_historico = st.tabs(["+ Criar Novo Pedido", "📋 Pedidos Registrados & Relatórios"])
+    
+        with aba_novo:
+            st.subheader("Registrar Novo Pedido")
+            
+            try:
+                df_p_cli = carregar_dados("SELECT * FROM produtos")
+                if not df_p_cli.empty:
+                    df_p_cli.columns = [c.lower() for c in df_p_cli.columns]
+                    col_nome_p = 'produto' if 'produto' in df_p_cli.columns else ('nome' if 'nome' in df_p_cli.columns else df_p_cli.columns[1])
+                    produtos_opt = df_p_cli[col_nome_p].dropna().astype(str).str.strip().unique().tolist()
+                else:
+                    produtos_opt = []
+            except Exception:
+                produtos_opt = []
+            
+            fornecedores_opt = carregar_coluna("fornecedores", "fornecedor") or ["BAHIA"]
+            grupos_opt = carregar_coluna("produtos", "grupo") or ["GERAL"]
+            
+            if "carrinho_cliente" not in st.session_state:
+                st.session_state.carrinho_cliente = []
+                
+            col_cli_1, col_cli_2 = st.columns(2)
+            with col_cli_1:
+                prod_item = st.selectbox("Selecione o Produto", produtos_opt if produtos_opt else ["Nenhum produto cad."], key="cli_select_produto")
+            with col_cli_2:
+                grupo_ped = st.selectbox("Selecione o Grupo", grupos_opt, key="cli_grupo_ind")
+            
+            col_cli_3, col_cli_4 = st.columns(2)
+            with col_cli_3:
+                fornec_ped = st.selectbox("Selecione o Fornecedor", fornecedores_opt, key="cli_forn_ind")
+            with col_cli_4:
+                qtd_ped = st.number_input("Quantidade", min_value=0.01, step=1.0, value=1.0, key="cli_qtd_ind")
+            
+            v_venda_ped = st.number_input("Preço Unitário (R$)", min_value=0.0, value=0.0, key=f"cli_v_ind_val")
+            valor_total_item = qtd_ped * v_venda_ped
+            st.info(f"**Valor Total do Item:** R$ {valor_total_item:.2f}")
+            
+            if st.button("➕ Incluir Produto no Pedido", type="primary", key="btn_incluir_prod_cli_portal"):
+                st.session_state.carrinho_cliente.append({
+                    "produto": prod_item,
+                    "fornecedor": fornec_ped,
+                    "grupo": grupo_ped,
+                    "quantidade": float(qtd_ped),
+                    "valor_unitario": float(v_venda_ped),
+                    "valor_total": float(valor_total_item)
+                })
+                st.success(f"✅ '{prod_item}' adicionado ao pedido!")
+                st.rerun()
+
+            st.markdown("---")
+            st.subheader("📋 Itens Atuais no Pedido")
+
+            if st.session_state.carrinho_cliente:
+                df_carrinho_cli = pd.DataFrame(st.session_state.carrinho_cli if 'carrinho_cli' in st.session_state else st.session_state.carrinho_cliente)
+                st.dataframe(df_carrinho_cli, use_container_width=True)
+
+                if st.button("🔴 Finalizar e Enviar Pedido", type="primary", key="btn_finalizar_cli_portal"):
+                    try:
+                        cursor = conn.cursor()
+                        data_agora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        cliente_logado = st.session_state.get('cliente_autenticado', 'Cliente')
+
+                        for item in st.session_state.carrinho_cliente:
+                            cursor.execute("""
+                                INSERT INTO pedidos (cliente, produto, fornecedor, grupo, quantidade, valor_unitario, valor_total, status, data) 
+                                VALUES (?, ?, ?, ?, ?, ?, ?, 'Pendente', ?)
+                            """, (cliente_logado, item['produto'], item['fornecedor'], item['grupo'], item['quantidade'], item['valor_unitario'], item['valor_total'], data_agora))
+                        
+                        conn.commit()
+                        st.session_state.carrinho_cliente = []
+                        st.success("✅ Pedido enviado com sucesso!")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Erro ao enviar pedido: {e}")
+            else:
+                st.info("Nenhum item adicionado ao carrinho ainda.")
+
+        with aba_historico:
+            st.subheader("📋 Pedidos Anteriores (Histórico)")
+            try:
+                query_hist_cliente = """
+                    SELECT id, produto, quantidade, valor_unitario, valor_total, status, data, fornecedor, grupo 
+                    FROM pedidos 
+                    WHERE cliente = ? 
+                    ORDER BY id DESC
+                """
+                df_hist_cli = pd.read_sql_query(query_hist_cliente, conn, params=(st.session_state.cliente_autenticado,))
+                if not df_hist_cli.empty:
+                    st.dataframe(df_hist_cli, use_container_width=True, hide_index=True)
+                else:
+                    st.info("Nenhum pedido anterior encontrado.")
+            except Exception as e_hist:
+                st.error(f"Erro ao carregar histórico: {e_hist}")
+# ==========================================
+# AMBIENTE 2: ADMINISTRADOR / VENDEDOR
+# ==========================================
+elif perfil_selecionado == "🔒 Administração / Vendedor":
+    if not st.session_state.admin_logged:
+        st.title("🔒 Autenticação Administrativa")
+        st.warning("⚠️ Insira a senha de administrador para aceder ao painel de gestão.")
+        
+        senha_admin = st.text_input("Digite a Senha do Admin:", type="password", key="input_senha_admin_login_v2")
+        
+        if st.button("🔓 Entrar como Admin", type="primary", key="btn_login_admin_v2"):
+            if senha_admin == "13142715":
+                st.session_state.admin_logged = True
+                st.success("Login efetuado com sucesso!")
+                st.rerun()
+            else:
+                st.error("Senha incorreta!")
+    else:
+        st.sidebar.subheader("🔒 Área Restrita")
+        if st.sidebar.button("Sair do Modo Admin", key="btn_logout_admin"):
+            st.session_state.admin_logged = False
+            st.rerun()
+            
+        menu_admin = st.sidebar.radio(
+            "Navegação",
+            [
+                "🛒 PDV — Frente de Caixa",
+                "🔓 Abertura e Fechamento de Caixa",
+                "📊 Fechamento & Financeiro",
+                "📋 Pedidos / Orçamentos",
+                "🛒 Registrar Venda",
+                "📥 Entrada de Estoque (Compras)",
+                "👥 Cadastros (Clientes / Fornecedores / Grupos)",
+                "👥 Gestão de Recursos Humanos (RH)",
+                "💾 Backup e Restauração",
+                "💸 Contas a Receber",
+                "📦 Estoque de Produtos",
+                "🏢 Configurações da Empresa"
+            ],
+            key="radio_menu_admin_opcoes"
+        )
+        
+        st.title(f"⚙️ Painel do Administrador — {menu_admin}")
+        
+        if menu_admin == "🏢 Configurações da Empresa":
+            st.title("🏢 Configurações e Dados da Empresa")
+            
+            # Carrega os dados da empresa deste dispositivo específico
+            df_emp_atual = pd.read_sql_query("SELECT * FROM empresas_dispositivos WHERE device_id = ?", conn, params=(device_id,))
+            reg_emp = df_emp_atual.iloc[0] if not df_emp_atual.empty else {}
+            
+            with st.form("form_atualizar_dados_empresa"):
+                c_nome_alt = st.text_input("Nome / Razão Social", value=str(reg_emp.get('nome_empresa', '')))
+                c_cnpj_alt = st.text_input("CNPJ ou CPF", value=str(reg_emp.get('cnpj', '')))
+                c_ie_alt = st.text_input("Inscrição Estadual (IE)", value=str(reg_emp.get('ie', '')))
+                c_tel_alt = st.text_input("Telefone de Contato", value=str(reg_emp.get('fone', '')))
+                c_end_alt = st.text_input("Endereço Completo", value=str(reg_emp.get('endereco', '')))
+                
+                if st.form_submit_button("💾 Salvar Alterações da Empresa", type="primary"):
+                    if c_nome_alt.strip() and c_cnpj_alt.strip():
+                        cnpj_limpo = ''.join(filter(str.isdigit, c_cnpj_alt))
+                        cursor = conn.cursor()
+                        cursor.execute("""
+                            INSERT OR REPLACE INTO empresas_dispositivos (device_id, nome_empresa, cnpj, ie, fone, endereco)
+                            VALUES (?, ?, ?, ?, ?, ?)
+                        """, (device_id, c_nome_alt.strip(), cnpj_limpo, c_ie_alt.strip(), c_tel_alt.strip(), c_end_alt.strip()))
+                        conn.commit()
+                        st.success("✅ Dados da empresa atualizados com sucesso!")
+                        st.rerun()
+                    else:
+                        st.error("Preencha o Nome e o CNPJ/CPF.")
+        if menu_admin == "🛒 PDV — Frente de Caixa":
+            # CSS para compactar e estilizar os botões de atalho no rodapé
+            st.markdown("""
+            <style>
+                .block-container { padding-top: 1rem !important; padding-bottom: 0rem !important; }
+                div[data-testid="stVerticalBlock"] > div { padding: 4px 8px !important; margin-bottom: 0px !important; }
+                .stMarkdown { margin-bottom: -10px !important; }
+                div[data-baseweb="input"] { min-height: 35px !important; }
+                h3, h4 { margin-top: 0px !important; margin-bottom: 5px !important; font-size: 16px !important; }
+                
+                /* Estilo da barra de atalhos inferior */
+                .barra-atalhos {
+                    background-color: #2b2b2b;
+                    color: #ffffff;
+                    padding: 8px 15px;
+                    border-radius: 8px;
+                    border: 2px solid #555555;
+                    margin-top: 15px;
+                    font-family: monospace;
+                    font-size: 13px;
+                    text-align: center;
+                }
+                .atalho-item {
+                    color: #00ffcc;
+                    font-weight: bold;
+                }
+            </style>
+            """, unsafe_allow_html=True)
+        
+            st.markdown("### 🛒 PDV — Frente de Caixa — REY DA CEBOLA")
+            
+            # --- VERIFICAÇÃO DE CAIXA ABERTO ---
+            df_caixa_aberto = carregar_dados("SELECT * FROM caixa_sessoes WHERE status = 'ABERTO'")
+            if df_caixa_aberto.empty:
+                st.warning("⚠️ Atenção: Não há nenhum caixa aberto no momento.")
+        
+            # --- CARREGAMENTO DE DADOS ---
+            clientes_opt = carregar_coluna("clientes", "nome") or ["Carlos Alberto"]
+            fornecedores_opt = carregar_coluna("fornecedores", "fornecedor") or ["BAHIA"]
+            grupos_opt = carregar_coluna("grupos", "grupo") or ["GERAL"]
+        
+            df_p = carregar_dados("SELECT * FROM produtos")
+            if not df_p.empty:
+                df_p.columns = [c.lower() for c in df_p.columns]
+                col_nome_p = 'produto' if 'produto' in df_p.columns else ('nome' if 'nome' in df_p.columns else df_p.columns[1])
+                produtos_opt = df_p[col_nome_p].dropna().astype(str).str.strip().unique().tolist()
+            else:
+                produtos_opt = ["AMEIXA IMPORTADA", "ABACATE"]
+        
+            # --- BARRA DE CÓDIGO DE BARRAS NO TOPO ---
+            col_cb1, col_cb2 = st.columns([4.5, 1])
+            with col_cb1:
+                cod_barras_lido = st.text_input(
+                    "Entre com o Código ou Código de barras:", 
+                    key="input_cb_pdv", 
+                    placeholder="Passe o leitor ou digite o código...",
+                    label_visibility="collapsed"
+                )
+            with col_cb2:
+                st.button("VERSÃO COMPLETA", type="primary", use_container_width=True)
+        
+            # FILTRO AUTOMÁTICO DO LEITOR
+            produtos_para_exibir = produtos_opt
+            if cod_barras_lido.strip() and not df_p.empty:
+                termo_cb = cod_barras_lido.strip().lower()
+                if 'codigo_barras' not in df_p.columns:
+                    df_p['codigo_barras'] = ''
+                    
+                df_cb_filtrado = df_p[
+                    (df_p['codigo_barras'].astype(str).str.lower().str.contains(termo_cb)) | 
+                    (df_p['id'].astype(str).str.lower() == termo_cb) | 
+                    (df_p[col_nome_p].astype(str).str.lower().str.contains(termo_cb))
+                ]
+                if not df_cb_filtrado.empty:
+                    produtos_para_exibir = [
+                        f"{r[col_nome_p]} — R$ {float(r.get('preco_venda', r.get('venda', r.get('valor_venda', 0))) or 0):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+                        for _, r in df_cb_filtrado.iterrows()
+                    ]
+        
+            cliente_pdv = clientes_opt[0]
+        
+            # --- LAYOUT PRINCIPAL EM 2 COLUNAS ---
+            col_pdv_esq, col_pdv_dir = st.columns([1, 1.3], gap="small")
+        
+            # =========================================================
+            # COLUNA ESQUERDA
+            # =========================================================
+            with col_pdv_esq:
+                st.markdown("#### 📦 Dados do Item")
+                prod_item = st.selectbox("Produto", produtos_para_exibir, key="pdv_select_produto", label_visibility="collapsed")
+                
+                preco_sugerido = 0.0
+                forn_sugerido = fornecedores_opt[0]
+                grupo_sugerido = grupos_opt[0]
+        
+                if not df_p.empty:
+                    df_p['nome_limpo'] = df_p[col_nome_p].astype(str).str.strip().str.upper()
+                    target_nome = str(prod_item).split(" — R$")[0].strip().upper()
+                    df_filtrado_p = df_p[df_p['nome_limpo'] == target_nome]
+        
+                    if not df_filtrado_p.empty:
+                        row_p = df_filtrado_p.iloc[0]
+                        for col_v in ['valor_venda', 'preco_venda', 'venda']:
+                            if col_v in df_p.columns:
+                                try:
+                                    val_aux = float(row_p[col_v])
+                                    if val_aux > 0:
+                                        preco_sugerido = val_aux
+                                        break
+                                except:
+                                    pass
+        
+                        if 'fornecedor' in df_p.columns and pd.notna(row_p['fornecedor']):
+                            forn_sugerido = str(row_p['fornecedor'])
+                        if 'grupo' in df_p.columns and pd.notna(row_p['grupo']):
+                            grupo_sugerido = str(row_p['grupo'])
+        
+                idx_f = fornecedores_opt.index(forn_sugerido) if fornecedores_opt and forn_sugerido in fornecedores_opt else 0
+                idx_g = grupos_opt.index(grupo_sugerido) if grupos_opt and grupo_sugerido in grupos_opt else 0
+                forn_item = fornecedores_opt[idx_f]
+                grupo_item = grupos_opt[idx_g]
+        
+                col_s1, col_s2 = st.columns(2)
+                with col_s1:
+                    qtd_item = st.number_input("Qtd", min_value=0.1, step=1.0, value=1.0, key="pdv_qtd")
+                with col_s2:
+                    v_unit_item = st.number_input("Preço Unit. (R$)", min_value=0.0, step=0.01, value=float(preco_sugerido), key=f"vunit_{prod_item}")
+        
+                valor_total_item = qtd_item * v_unit_item
+                
+                st.markdown(f"""
+                <div style="background-color: #ffffff; padding: 6px; border-radius: 6px; border: 2px solid #888888; text-align: center; margin-top: 5px;">
+                    <span style="color: #444444; font-size: 11px; font-weight: bold;">SUBTOTAL</span><br>
+                    <span style="color: #000000; font-size: 20px; font-weight: bold;">R$ {valor_total_item:,.2f}</span>
+                </div>
+                """.replace(",", "X").replace(".", ",").replace("X", "."), unsafe_allow_html=True)
+        
+                if st.button("➕ [ Enter ] Incluir Produto", type="primary", use_container_width=True):
+                    st.session_state.carrinho_pdv.append({
+                        "produto": str(prod_item).split(" — R$")[0],
+                        "fornecedor": forn_item,
+                        "grupo": grupo_item,
+                        "quantidade": qtd_item,
+                        "valor_venda": v_unit_item,
+                        "valor_total": valor_total_item
+                    })
+                    st.rerun()
+        
+            # =========================================================
+            # COLUNA DIREITA: CARRINHO E FINALIZAÇÃO
+            # =========================================================
+            with col_pdv_dir:
+                st.markdown("#### 📋 Carrinho")
+                if len(st.session_state.carrinho_pdv) > 0:
+                    df_carrinho = pd.DataFrame(st.session_state.carrinho_pdv)
+                    altura_dinamica = 38 + (len(df_carrinho) * 35)
+                    st.dataframe(
+                        df_carrinho[['produto', 'quantidade', 'valor_venda', 'valor_total']], 
+                        use_container_width=True, 
+                        hide_index=True, 
+                        height=altura_dinamica
+                    )
+                    total_geral_carrinho = df_carrinho['valor_total'].sum()
+                else:
+                    st.info("Carrinho vazio.")
+                    total_geral_carrinho = 0.0
+        
+                col_pag1, col_pag2 = st.columns(2)
+                with col_pag1:
+                    f_pag = st.selectbox("Forma Pagto", ["Dinheiro", "Pix", "Cartão de Crédito", "Cartão de Débito", "Fiado / Prazo"], key="pdv_forma_pagto")
+                with col_pag2:
+                    v_rec = st.number_input("Valor Rec. (R$)", min_value=0.0, step=1.0, value=float(total_geral_carrinho), key="pdv_val_rec")
+                
+                troco = v_rec - total_geral_carrinho if v_rec > total_geral_carrinho else 0.0
+        
+                col_t1, col_t2 = st.columns(2)
+                with col_t1:
+                    st.markdown(f"""
+                    <div style="background-color: #ffffff; padding: 6px; border-radius: 6px; border: 2px solid #28a745; text-align: center;">
+                        <span style="color: #28a745; font-size: 11px; font-weight: bold;">TOTAL</span><br>
+                        <span style="color: #000000; font-size: 20px; font-weight: bold;">R$ {total_geral_carrinho:,.2f}</span>
+                    </div>
+                    """.replace(",", "X").replace(".", ",").replace("X", "."), unsafe_allow_html=True)
+                with col_t2:
+                    st.markdown(f"""
+                    <div style="background-color: #ffffff; padding: 6px; border-radius: 6px; border: 2px solid #17a2b8; text-align: center;">
+                        <span style="color: #17a2b8; font-size: 11px; font-weight: bold;">TROCO</span><br>
+                        <span style="color: #000000; font-size: 20px; font-weight: bold;">R$ {troco:,.2f}</span>
+                    </div>
+                    """.replace(",", "X").replace(".", ",").replace("X", "."), unsafe_allow_html=True)
+        
+                if st.button("🟢 Finalizar Venda [ Alt + V ]", type="primary", use_container_width=True):
+                    if not df_caixa_aberto.empty and len(st.session_state.carrinho_pdv) > 0:
+                        cursor = conn.cursor()
+                        sessao_id = int(df_caixa_aberto.iloc[0]['id'])
+                        data_venda = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        
+                        for item in st.session_state.carrinho_pdv:
+                            cursor.execute("""
+                                INSERT INTO vendas (cliente, produto, fornecedor, grupo, quantidade, valor_venda, valor_total, forma_pagamento, valor_recebido, status, tipo, data)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """, (
+                                cliente_pdv, item['produto'], item['fornecedor'], item['grupo'],
+                                item['quantidade'], item['valor_venda'], item['valor_total'],
+                                f_pag, v_rec, 'Concluído', 'VENDA', data_venda
+                            ))
+        
+                        cursor.execute("""
+                            INSERT INTO caixa_movimentacoes (sessao_id, tipo, valor, descricao, data) 
+                            VALUES (?, ?, ?, ?, ?)
+                        """, (
+                            sessao_id, "VENDA", float(total_geral_carrinho), f"Venda PDV - Cliente: {cliente_pdv}", data_venda
+                        ))
+                        
+                        conn.commit()
+                        st.session_state.carrinho_pdv = []
+                        st.success(f"Venda concluída! Troco: R$ {max(0.0, troco):.2f}")
+                        st.rerun()
+                    else:
+                        st.error("Verifique se o caixa está aberto e se há itens no carrinho.")
+        
+                # --- BARRA DE ATALHOS NO RODAPÉ (100% BRANCO FORÇADO) ---
+                st.markdown("""
+                <div style="background-color: #0d1b2a; padding: 8px; border-radius: 6px; text-align: center; font-family: monospace; font-size: 14px; font-weight: bold; margin-top: 4px;">
+                    <span style="color: #ffffff !important; -webkit-text-fill-color: #ffffff;">&#91; Enter &#93; Incluir &nbsp;|&nbsp; &#91; Alt + C &#93; Limpar &nbsp;|&nbsp; &#91; Alt + V &#93; Finalizar</span>
+                </div>
+                """, unsafe_allow_html=True)
+        
+            # =========================================================
+            # ATALHOS REALMENTE FUNCIONAIS (SEM CONFLITO COM O WINDOWS)
+            # =========================================================
+            st.components.v1.html("""
+            <script>
+            const doc = window.parent.document;
+            doc.addEventListener('keydown', function(e) {
+                // Alt + V (Finalizar Venda)
+                if (e.altKey && (e.key === 'v' || e.key === 'V')) {
+                    e.preventDefault();
+                    const btns = doc.querySelectorAll('button');
+                    btns.forEach(b => { if (b.innerText.includes('Finalizar Venda')) b.click(); });
+                }
+                // Alt + C ou Delete (Limpar Carrinho)
+                if (e.altKey && (e.key === 'c' || e.key === 'C')) {
+                    e.preventDefault();
+                    const btns = doc.querySelectorAll('button');
+                    btns.forEach(b => { if (b.innerText.includes('Limpar Carrinho')) b.click(); });
+                }
+            });
+            </script>
+            """, height=0)
+        elif menu_admin == "🔓 Abertura e Fechamento de Caixa":
+            st.title("🔓 Abertura e Fechamento de Caixa")
+            df_caixa_atual = carregar_dados("SELECT * FROM caixa_sessoes WHERE status = 'ABERTO'")
+
+            if df_caixa_atual.empty:
+                st.info("O caixa encontra-se **FECHADO**. Insira o valor inicial para abri-lo.")
+                with st.form("form_abrir_caixa"):
+                    saldo_inicial = st.number_input("Saldo Inicial em Dinheiro (Troco / Fundo de Caixa)", min_value=0.0, step=10.0)
+                    if st.form_submit_button("Abrir Caixa"):
+                        cursor = conn.cursor()
+                        data_agora = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        cursor.execute("INSERT INTO caixa_sessoes (data_abertura, saldo_inicial, status) VALUES (?, ?, ?)", (data_agora, saldo_inicial, "ABERTO"))
+                        conn.commit()
+                        st.success("Caixa aberto com sucesso!")
+                        st.rerun()
+            else:
+                sessao_id = int(df_caixa_atual.iloc[0]['id'])
+                data_abertura = df_caixa_atual.iloc[0]['data_abertura']
+                saldo_inicial = float(df_caixa_atual.iloc[0]['saldo_inicial'])
+                
+                st.success(f"🟢 **Caixa ABERTO** desde: {data_abertura} | Saldo Inicial: R$ {saldo_inicial:,.2f}")
+                df_movs = carregar_dados(f"SELECT * FROM caixa_movimentacoes WHERE sessao_id = {sessao_id}")
+                total_movimentado = df_movs['valor'].sum() if not df_movs.empty else 0.0
+                
+                st.metric("Total Movimentado neste Caixa", f"R$ {total_movimentado:,.2f}")
+                if not df_movs.empty:
+                    st.dataframe(df_movs, use_container_width=True)
+                
+                st.markdown("---")
+                with st.form("form_fechar_caixa"):
+                    saldo_final_informado = st.number_input("Conferência de Saldo Final (Dinheiro em Caixa)", min_value=0.0, step=10.0, value=saldo_inicial + total_movimentado)
+                    if st.form_submit_button("🔒 Fechar Caixa"):
+                        cursor = conn.cursor()
+                        data_fechamento = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        cursor.execute("UPDATE caixa_sessoes SET data_fechamento = ?, saldo_final = ?, status = ? WHERE id = ?", (data_fechamento, saldo_final_informado, "FECHADO", sessao_id))
+                        conn.commit()
+                        st.success("Caixa fechado com sucesso!")
+                        st.rerun()
+
+        elif menu_admin == "📊 Fechamento & Financeiro":
+            st.header("📊 Painel Financeiro & Fechamento por Data")
+            st.subheader("💳 Contas a Receber (Parcelas / Fiado)")
+
+            df_vendas_fin = carregar_dados("SELECT id, cliente, produto, fornecedor, quantidade, valor_venda, valor_total, forma_pagamento, valor_recebido, troco, restante, data, grupo FROM vendas ORDER BY id DESC")
+            df_pedidos_fin = carregar_dados("SELECT * FROM pedidos ORDER BY id DESC")
+            
+            if not df_vendas_fin.empty and 'restante' in df_vendas_fin.columns:
+                df_vendas_fin['restante'] = pd.to_numeric(df_vendas_fin['restante'], errors='coerce').fillna(0.0)
+                df_pendentes_fin = df_vendas_fin[df_vendas_fin['restante'] > 0]
+                if not df_pendentes_fin.empty:
+                    st.warning(f"⚠️ Existem {len(df_pendentes_fin)} registro(s) de crediário com saldo pendente.")
+                else:
+                    st.info("Nenhuma parcela pendente de recebimento no momento.")
+            else:
+                st.info("Nenhuma parcela pendente de recebimento no momento.")
+            
+            st.markdown("---")
+            
+            clientes_vendas = df_vendas_fin['cliente'].dropna().astype(str).unique().tolist() if not df_vendas_fin.empty and 'cliente' in df_vendas_fin.columns else []
+            clientes_pedidos = df_pedidos_fin['cliente'].dropna().astype(str).unique().tolist() if not df_pedidos_fin.empty and 'cliente' in df_pedidos_fin.columns else []
+            todos_clientes = sorted(list(set(clientes_vendas + clientes_pedidos)))
+            lista_clientes_fin = ["Todos"] + todos_clientes
+            
+            col_f1, col_f2, col_f3, col_f4 = st.columns([2.5, 2, 2, 2.5])
+            
+            with col_f1:
+                f_cliente_fin = st.selectbox("Filtrar por Cliente:", lista_clientes_fin, key="f_cli_painel_fin")
+            with col_f2:
+                data_inicio_def = dt.date(2025, 1, 1)
+                data_inicio = st.date_input("Data Inicial", value=data_inicio_def, key="dt_inicio_fin")
+            with col_f3:
+                data_fim = st.date_input("Data Final", value=dt.date.today(), key="dt_fim_fin")
+            with col_f4:
+                opcao_status = st.selectbox("Status dos Registros", ["Incluir Pedidos Pendentes", "Apenas Vendas Concluídas", "Apenas Pedidos Pendentes"], key="status_registros_fin")
+            
+            dfs_para_concatenar = []
+            
+            if not df_vendas_fin.empty and opcao_status != "Apenas Pedidos Pendentes":
+                df_v = df_vendas_fin.copy()
+                if 'data' in df_v.columns:
+                    df_v['dt_formatada'] = pd.to_datetime(df_v['data'], errors='coerce').dt.date
+                    df_v['dt_formatada'] = df_v['dt_formatada'].fillna(pd.to_datetime(df_v['data'].astype(str).str[:10], errors='coerce').dt.date)
+                dfs_para_concatenar.append(df_v)
+            
+            if not df_pedidos_fin.empty and opcao_status in ["Incluir Pedidos Pendentes", "Apenas Pedidos Pendentes"]:
+                df_p = df_pedidos_fin[df_pedidos_fin['status'].astype(str).str.upper().str.contains("PENDENTE")].copy()
+                if not df_p.empty:
+                    if 'data' in df_p.columns:
+                        df_p['dt_formatada'] = pd.to_datetime(df_p['data'], errors='coerce').dt.date
+                        df_p['dt_formatada'] = df_p['dt_formatada'].fillna(pd.to_datetime(df_p['data'].astype(str).str[:10], errors='coerce').dt.date)
+            
+                    if 'valor_unitario' in df_p.columns and 'valor_venda' not in df_p.columns:
+                        df_p['valor_venda'] = df_p['valor_unitario']
+                    if 'forma_pagamento' not in df_p.columns:
+                        df_p['forma_pagamento'] = "PENDENTE"
+                    if 'valor_recebido' not in df_p.columns:
+                        df_p['valor_recebido'] = 0.0
+                    if 'troco' not in df_p.columns:
+                        df_p['troco'] = 0.0
+                    if 'restante' not in df_p.columns:
+                        df_p['restante'] = df_p['valor_total']
+            
+                    dfs_para_concatenar.append(df_p)
+            
+            if dfs_para_concatenar:
+                df_fin_geral = pd.concat(dfs_para_concatenar, ignore_index=True)
+            else:
+                df_fin_geral = pd.DataFrame()
+            
+            if not df_fin_geral.empty:
+                if f_cliente_fin != "Todos":
+                    df_fin_geral = df_fin_geral[df_fin_geral['cliente'].astype(str) == str(f_cliente_fin)]
+            
+                if 'dt_formatada' in df_fin_geral.columns:
+                    df_fin_geral = df_fin_geral[(df_fin_geral['dt_formatada'] >= data_inicio) & (df_fin_geral['dt_formatada'] <= data_fim)]
+            
+            if not df_fin_geral.empty:
+                for c in ['valor_total', 'valor_recebido', 'restante']:
+                    if c in df_fin_geral.columns:
+                        df_fin_geral[c] = pd.to_numeric(df_fin_geral[c], errors='coerce').fillna(0.0)
+            
+                fat_periodo = float(df_fin_geral['valor_total'].sum())
+                rec_caixa = float(df_fin_geral['valor_recebido'].sum())
+                tot_pendente = float(df_fin_geral['restante'].sum())
+            else:
+                fat_periodo = 0.0
+                rec_caixa = 0.0
+                tot_pendente = 0.0
+            
+            col_m1, col_m2, col_m3 = st.columns(3)
+            with col_m1:
+                st.markdown("**Faturamento do Período**")
+                st.markdown(f"### R$ {fat_periodo:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
+            with col_m2:
+                st.markdown("**Total Recebido em Caixa**")
+                st.markdown(f"### R$ {rec_caixa:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
+            with col_m3:
+                st.markdown("**Total Pendente / Fiado**")
+                st.markdown(f"### R$ {tot_pendente:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
+            
+            st.markdown("---")
+            
+            if not df_fin_geral.empty:
+                cols_ordem = ['id', 'cliente', 'produto', 'fornecedor', 'quantidade', 'valor_venda', 'valor_total', 'forma_pagamento', 'valor_recebido', 'troco', 'restante', 'data', 'grupo']
+                cols_presentes = [c for c in cols_ordem if c in df_fin_geral.columns]
+                st.dataframe(df_fin_geral[cols_presentes], use_container_width=True)
+            else:
+                st.info("Nenhum registro encontrado para os filtros selecionados.")
+
+        elif menu_admin in ["📋 Pedidos / Orçamentos", "🛒 Registrar Venda"]:
+            st.title(f"🛒 {menu_admin}")
+
+            # --- IMPORTAÇÃO DIRETA PELA TELA DA APLICAÇÃO ---
+            with st.expander("📥 Importar / Colar Lista de Produtos em Massa"):
+                st.info("Cole abaixo a sua lista copiada diretamente do Excel ou Bloco de Notas.")
+                
+                texto_lista_colada = st.text_area(
+                    "Cole os produtos aqui:",
+                    placeholder="Exemplo:\n1\tABACATE\t6\tBAHIA\tGERAL\t0\t0",
+                    key="input_texto_produtos_massa"
+                )
+                
+                if st.button("🚀 Processar e Importar Lista Colada"):
+                    if not texto_lista_colada.strip():
+                        st.warning("⚠️ Por favor, cole os dados na caixa de texto acima antes de importar.")
+                    else:
+                        try:
+                            cursor = conn.cursor()
+                            linhas = texto_lista_colada.strip().split("\n")
+                            sucessos = 0
+                            
+                            for linha in linhas:
+                                if not linha.strip():
+                                    continue
+                                
+                                # Divide a linha rigorosamente por tabulação (formato de tabela copiada)
+                                partes = linha.split("\t")
+                                if len(partes) < 2:
+                                    # Fallback caso venha com espaços normais
+                                    partes = linha.strip().split()
+                                    
+                                # Mapeia as colunas com base na estrutura (ID, Produto, Qtd, Fornecedor, Grupo, V.Compra, V.Venda)
+                                if len(partes) >= 7:
+                                    prod = partes[1].strip().upper()
+                                    qtd = float(partes[2].strip().replace(',', '.') or 0.0)
+                                    forn = partes[3].strip().upper()
+                                    grupo = partes[4].strip().upper()
+                                    v_compra = float(partes[5].strip().replace(',', '.') or 0.0)
+                                    v_venda = float(partes[6].strip().replace(',', '.') or 0.0)
+                                elif len(partes) >= 6:
+                                    prod = partes[0].strip().upper()
+                                    qtd = float(partes[1].strip().replace(',', '.') or 0.0)
+                                    forn = partes[2].strip().upper()
+                                    grupo = partes[3].strip().upper()
+                                    v_compra = float(partes[4].strip().replace(',', '.') or 0.0)
+                                    v_venda = float(partes[5].strip().replace(',', '.') or 0.0)
+                                else:
+                                    continue
+                                    
+                                # Insere ou atualiza de forma limpa usando a restrição OR REPLACE
+                                cursor.execute("""
+                                    INSERT OR REPLACE INTO produtos (produto, grupo, fornecedor, quantidade, valor_compra, valor_venda)
+                                    VALUES (?, ?, ?, ?, ?, ?)
+                                """, (prod, grupo, forn, qtd, v_compra, v_venda))
+                                sucessos += 1
+                                
+                            conn.commit()
+                            if sucessos > 0:
+                                st.success(f"✅ {sucessos} produtos importados/atualizados com sucesso!")
+                                st.rerun()
+                            else:
+                                st.warning("⚠️ Nenhum produto válido foi detetado. Verifique o formato do texto colado.")
+                        except Exception as e:
+                            st.error(f"Erro ao processar a lista: {e}")
+        
+            try:
+                df_produtos = pd.read_sql_query("SELECT * FROM produtos", conn)
+            except Exception:
+                df_produtos = pd.DataFrame()
+        
+            # Filtro de stock
+            filtro_estoque = st.selectbox(
+                "Filtrar por Status do Stock:",
+                ["Todos", "Com Stock (> 0)", "Zerados (= 0)"],
+                key="filtro_status_stock"
+            )
+        
+            cols_esperadas = ['id', 'produto', 'quantidade', 'fornecedor', 'grupo', 'valor_compra', 'valor_venda']
+            for c in cols_esperadas:
+                if c not in df_produtos.columns:
+                    df_produtos[c] = 0.0 if ('valor' in c or 'quantidade' in c) else ""
+        
+            if not df_produtos.empty:
+                cols_finais = [c for c in cols_esperadas if c in df_produtos.columns]
+                df_produtos = df_produtos[cols_finais]
+                
+                # Aplica o filtro de quantidade de forma segura
+                df_produtos['quantidade'] = pd.to_numeric(df_produtos['quantidade'], errors='coerce').fillna(0)
+                
+                if filtro_estoque == "Com Stock (> 0)":
+                    df_produtos = df_produtos[df_produtos['quantidade'] > 0]
+                elif filtro_estoque == "Zerados (= 0)":
+                    df_produtos = df_produtos[df_produtos['quantidade'] == 0]
+    
+            df_estoque_editado = st.data_editor(df_produtos, use_container_width=True, hide_index=True, key="editor_estoque_produtos")
+    
+            col_salvar, col_atualizar, col_pdf = st.columns([1, 1, 1])
+    
+            with col_salvar:
+                if st.button("💾 Salvar Alterações no Estoque", type="primary", key="btn_salvar_estoque"):
+                    try:
+                        cursor = conn.cursor()
+                        for col in ["grupo", "fornecedor"]:
+                            try:
+                                cursor.execute(f"ALTER TABLE produtos ADD COLUMN {col} TEXT")
+                            except Exception:
+                                pass
+    
+                        for _, row in df_estoque_editado.iterrows():
+                            cursor.execute("""
+                                UPDATE produtos 
+                                SET produto = ?, quantidade = ?, valor_compra = ?, valor_venda = ?, grupo = ?, fornecedor = ? 
+                                WHERE id = ?
+                            """, (str(row['produto']).strip(), float(row['quantidade']), float(row['valor_compra']), float(row['valor_venda']), str(row.get('grupo', '')), str(row.get('fornecedor', '')), int(row['id'])))
+    
+                        conn.commit()
+                        st.cache_data.clear()
+                        st.success("✅ Alterações do estoque salvas com sucesso!")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Erro ao salvar: {e}")
+    
+            with col_atualizar:
+                if st.button("🔄 Atualizar Preços de Compra", key="btn_atualizar_precos"):
+                    try:
+                        with conn:
+                            cursor = conn.cursor()
+                            cursor.execute("UPDATE produtos SET valor_compra = (SELECT valor_compra FROM compras WHERE compras.produto = produtos.produto ORDER BY id DESC LIMIT 1) WHERE EXISTS (SELECT 1 FROM compras WHERE compras.produto = produtos.produto)")
+                        st.cache_data.clear()
+                        st.success("✅ Preços de compra atualizados com sucesso!")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Erro ao atualizar preço: {e}")
+
+            with col_pdf:
+                # --- BOTÃO PARA GERAR PDF DO ESTOQUE COM TOTAIS ---
+                try:
+                    import io
+                    from reportlab.lib.pagesizes import letter
+                    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+                    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+                    from reportlab.lib import colors
+
+                    def gerar_pdf_estoque(df_dados):
+                        buffer = io.BytesIO()
+                        doc = SimpleDocTemplate(buffer, pagesize=letter, rightMargin=30, leftMargin=30, topMargin=30, bottomMargin=30)
+                        elements = []
+                        styles = getSampleStyleSheet()
+                        
+                        title_style = ParagraphStyle(
+                            'TitleStyle',
+                            parent=styles['Heading1'],
+                            fontSize=16,
+                            textColor=colors.HexColor('#1f2937'),
+                            spaceAfter=5,
+                            alignment=1
+                        )
+                        
+                        sub_style = ParagraphStyle(
+                            'SubStyle',
+                            parent=styles['Normal'],
+                            fontSize=10,
+                            textColor=colors.HexColor('#4b5563'),
+                            spaceAfter=15,
+                            alignment=1
+                        )
+                        
+                        elements.append(Paragraph("Relatório de Estoque de Produtos e Preços", title_style))
+                        
+                        # Calcula os valores totais (Quantidade * Valor)
+                        total_compra = 0.0
+                        total_venda = 0.0
+                        
+                        for _, row in df_dados.iterrows():
+                            try:
+                                qtd = float(str(row.get('quantidade', 0)).replace(',', '.') or 0.0)
+                                v_compra = float(str(row.get('valor_compra', 0)).replace(',', '.') or 0.0)
+                                v_venda = float(str(row.get('valor_venda', 0)).replace(',', '.') or 0.0)
+                                
+                                total_compra += qtd * v_compra
+                                total_venda += qtd * v_venda
+                            except:
+                                pass
+                                
+                        # Formata o texto dos totais para exibir no PDF
+                        texto_totais = f"<b>Valor Total de Compras:</b> R$ {total_compra:,.2f} &nbsp;&nbsp;|&nbsp;&nbsp; <b>Valor Total de Vendas:</b> R$ {total_venda:,.2f}"
+                        elements.append(Paragraph(texto_totais, sub_style))
+                        elements.append(Spacer(1, 5))
+                        
+                        # Cabeçalho e dados da tabela
+                        data = [["ID", "Produto", "Qtd", "Fornecedor", "Grupo", "V. Compra", "V. Venda"]]
+                        for _, row in df_dados.iterrows():
+                            data.append([
+                                str(row.get('id', '')),
+                                str(row.get('produto', '')),
+                                str(row.get('quantidade', '')),
+                                str(row.get('fornecedor', '')),
+                                str(row.get('grupo', '')),
+                                f"R$ {float(str(row.get('valor_compra', 0)).replace(',', '.') or 0):.2f}",
+                                f"R$ {float(str(row.get('valor_venda', 0)).replace(',', '.') or 0):.2f}"
+                            ])
+                            
+                        t = Table(data, colWidths=[35, 170, 50, 85, 75, 60, 60])
+                        t.setStyle(TableStyle([
+                            ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#374151')),
+                            ('TEXTCOLOR', (0,0), (-1,0), colors.white),
+                            ('ALIGN', (0,0), (-1,-1), 'LEFT'),
+                            ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
+                            ('FONTSIZE', (0,0), (-1,0), 9),
+                            ('BOTTOMPADDING', (0,0), (-1,0), 6),
+                            ('BACKGROUND', (0,1), (-1,-1), colors.HexColor('#f9fafb')),
+                            ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor('#d1d5db')),
+                            ('FONTNAME', (0,1), (-1,-1), 'Helvetica'),
+                            ('FONTSIZE', (0,1), (-1,-1), 8),
+                        ]))
+                        
+                        elements.append(t)
+                        doc.build(elements)
+                        buffer.seek(0)
+                        return buffer.getvalue()
+
+                    pdf_estoque_bytes = gerar_pdf_estoque(df_estoque_editado)
+                    
+                    st.download_button(
+                        label="📄 Gerar PDF do Estoque",
+                        data=pdf_estoque_bytes,
+                        file_name="relatorio_estoque.pdf",
+                        mime="application/pdf",
+                        key="btn_baixar_pdf_estoque"
+                    )
+                except Exception as e_pdf_est:
+                    st.error(f"Erro ao gerar PDF: {e_pdf_est}")
+            if "carrinho_admin" not in st.session_state:
+                st.session_state.carrinho_admin = []
+        
+            aba_cad, aba_list = st.tabs(["+ Novo Registro / Pedido", "🔧 Tabela Editável"])
+        
+            with aba_cad:
+                clientes_opt = carregar_coluna("clientes", "nome") or ["Carlos Alberto"]
+                
+                df_p_admin = carregar_dados("SELECT * FROM produtos")
+                if not df_p_admin.empty:
+                    df_p_admin.columns = [c.lower() for c in df_p_admin.columns]
+                    col_nome_p = 'produto' if 'produto' in df_p_admin.columns else ('nome' if 'nome' in df_p_admin.columns else df_p_admin.columns[1])
+                    produtos_base = df_p_admin[col_nome_p].dropna().astype(str).str.strip().unique().tolist()
+                else:
+                    produtos_base = ["AMEIXA IMPORTADA", "ABACATE"]
+                    df_p_admin = pd.DataFrame()
+        
+                produtos_opt = list(produtos_base) + ["➕ Cadastrar Novo Produto..."]
+                fornecedores_opt = carregar_coluna("fornecedores", "fornecedor") or ["BAHIA"]
+                grupos_opt = carregar_coluna("grupos", "grupo") or ["GERAL"]
+        
+                if "prod_selecionado_temp" in st.session_state:
+                    st.session_state["ped_select_produto"] = st.session_state.pop("prod_selecionado_temp")
+                
+                opcoes_produtos_com_novo = ["+ Cadastrar Novo Produto..."] + list(produtos_opt)
+                
+                cliente_ped = st.selectbox("Cliente", clientes_opt, key="ped_cli_ind")
+                
+                col_l2_1, col_l2_2 = st.columns(2)
+                with col_l2_1:
+                    prod_item = st.selectbox("Selecione o Produto", opcoes_produtos_com_novo, key="ped_select_produto")
+                with col_l2_2:
+                    grupo_ped = st.selectbox("Grupo", grupos_opt, key="ped_grupo_ind")
+                
+                if prod_item == "+ Cadastrar Novo Produto...":
+                    st.warning("⚠️ Preencha os dados abaixo para cadastrar o novo produto:")
+                
+                    c_cad1, c_cad2, c_cad3 = st.columns([2, 1, 1])
+                    with c_cad1:
+                        novo_nome_prod = st.text_input("Nome do Novo Produto", key="cad_novo_nome_ped").strip().upper()
+                    with c_cad2:
+                        c_g_r = st.selectbox("Grupo", grupos_opt, key="cad_g_rapido")
+                    with c_cad3:
+                        c_f_r = st.selectbox("Fornecedor", fornecedores_opt, key="cad_f_rapido")
+                
+                    c_cad4, c_cad5, c_cad6 = st.columns([1, 1, 1])
+                    with c_cad4:
+                        c_qtd_r = st.number_input("Qtd Inicial em Estoque", min_value=0.0, value=0.0, key="cad_q_rapido")
+                    with c_cad5:
+                        c_compra_r = st.number_input("Preço de Compra (R$)", min_value=0.0, value=0.0, key="cad_c_rapido")
+                    with c_cad6:
+                        c_venda_r = st.number_input("Preço de Venda (R$)", min_value=0.0, value=0.0, key="cad_v_rapido")
+                
+                    if st.button("💾 Salvar e Selecionar Produto", key="btn_salvar_novo_prod_ped"):
+                        if novo_nome_prod:
+                            try:
+                                cursor = conn.cursor()
+                                cursor.execute("SELECT id FROM produtos WHERE UPPER(produto) = UPPER(?)", (novo_nome_prod,))
+                                existe = cursor.fetchone()
+                
+                                if existe:
+                                    st.warning(f"⚠️ O produto '{novo_nome_prod}' já está cadastrado!")
+                                    st.session_state["prod_selecionado_temp"] = novo_nome_prod
+                                    st.rerun()
+                                else:
+                                    cursor.execute("INSERT INTO produtos (produto, grupo, fornecedor, quantidade, valor_compra, valor_venda) VALUES (?, ?, ?, ?, ?, ?)", (novo_nome_prod, c_g_r, c_f_r, c_qtd_r, c_compra_r, c_venda_r))
+                                    conn.commit()
+                                    st.cache_data.clear()
+                                    st.session_state["prod_selecionado_temp"] = novo_nome_prod
+                                    st.rerun()
+                            except Exception as e:
+                                st.error(f"Erro ao cadastrar: {e}")
+                        else:
+                            st.error("Digite o nome do produto.")
+                        st.stop()
+                
+                preco_sugerido_admin = 0.0
+                if not df_p_admin.empty and prod_item != "+ Cadastrar Novo Produto...":
+                    df_p_admin.columns = [c.lower() for c in df_p_admin.columns]
+                    col_nome_p = 'produto' if 'produto' in df_p_admin.columns else ('nome' if 'nome' in df_p_admin.columns else df_p_admin.columns[1])
+                    df_p_admin['_nome_limpo'] = df_p_admin[col_nome_p].astype(str).str.strip().str.upper()
+                    df_filtrado_admin = df_p_admin[df_p_admin['_nome_limpo'] == str(prod_item).strip().upper()]
+                
+                    if not df_filtrado_admin.empty:
+                        row_adm = df_filtrado_admin.iloc[0]
+                        for col_v in ['valor_venda', 'preco_venda', 'venda', 'preco', 'valor']:
+                            if col_v in df_p_admin.columns:
+                                try:
+                                    val_aux = float(row_adm[col_v])
+                                    if val_aux > 0:
+                                        preco_sugerido_admin = val_aux
+                                        break
+                                except:
+                                    pass
+                
+                col_l3_1, col_l3_2 = st.columns(2)
+                with col_l3_1:
+                    fornec_ped = st.selectbox("Fornecedor", fornecedores_opt, key="ped_forn_ind")
+                with col_l3_2:
+                    qtd_ped = st.number_input("Quantidade", min_value=0.01, step=1.0, value=1.0, key="ped_qtd_ind")
+                
+                col_l4_1, col_l4_2 = st.columns(2)
+                with col_l4_1:
+                    v_venda_ped = st.number_input("Preço Unitário (R$)", min_value=0.0, value=float(preco_sugerido_admin), key=f"ped_v_ind_{prod_item}")
+                with col_l4_2:
+                    valor_total_item = qtd_ped * v_venda_ped
+                    st.info(f"**Valor Total do Item:** R$ {valor_total_item:.2f}")
+                
+                # Garante que o carrinho do cliente existe na sessão e nunca é apagado sozinho
+                if "carrinho_cliente" not in st.session_state:
+                    st.session_state.carrinho_cliente = []
+            
+                if st.button("➕ Incluir Produto no Pedido", type="primary", key="btn_incluir_prod_cli"):
+                    if prod_item == "+ Cadastrar Novo Produto...":
+                        st.error("Por favor, selecione ou cadastre o produto antes de incluir no pedido.")
+                    else:
+                        # Verifica se o produto já existe na lista atual do carrinho
+                        produto_ja_existe = False
+                        for item in st.session_state.carrinho_cliente:
+                            if str(item.get("produto", "")).strip().upper() == str(prod_item).strip().upper():
+                                produto_ja_existe = True
+                                break
+            
+                        if produto_ja_existe:
+                            st.warning(f"⚠️ O produto **'{prod_item}'** já existe no carrinho!")
+                        else:
+                            # Adiciona o novo item mantendo os anteriores intactos
+                            st.session_state.carrinho_cliente.append({
+                                "produto": prod_item,
+                                "fornecedor": fornec_ped,
+                                "grupo": grupo_ped,
+                                "quantidade": float(qtd_ped),
+                                "valor_unitario": float(v_venda_ped),
+                                "preco_unitario": float(v_venda_ped),
+                                "valor_total": float(valor_total_item)
+                            })
+                            st.success(f"✅ '{prod_item}' adicionado ao pedido com sucesso!")
+                            st.rerun()
+        
+                st.markdown("---")
+                st.subheader("📋 Itens Atuais no Pedido")
+            
+                if 'modo_edicao_carrinho' not in st.session_state:
+                    st.session_state.modo_edicao_carrinho = False
+            
+                carrinho_atual = st.session_state.get('carrinho_cliente', [])
+            
+                if carrinho_atual:
+                    df_carrinho = pd.DataFrame(carrinho_atual)
+            
+                    if st.session_state.modo_edicao_carrinho:
+                        st.info("💡 **Modo de Edição Ativo:** Altere as quantidades ou valores diretamente na tabela abaixo e depois clique em **'💾 Salvar'**.")
+                        df_editado = st.data_editor(df_carrinho, use_container_width=True, key="editor_itens_carrinho")
+                    else:
+                        st.dataframe(df_carrinho, use_container_width=True)
+            
+                    col_btn1, col_btn2, col_btn3, col_btn4 = st.columns(4)
+            
+                    with col_btn1:
+                        if st.button("🗑️ Limpar Carrinho", key="btn_limpar_carrinho_admin"):
+                            # Esvazia a lista unificada do carrinho na sessão
+                            st.session_state.carrinho_cliente = []
+                            st.success("✅ Carrinho limpo com sucesso!")
+                            st.rerun()
+            
+                    with col_btn2:
+                        if st.button("✏️ Alterar", use_container_width=True, key="btn_alterar_carrinho_v2"):
+                            st.session_state.modo_edicao_carrinho = True
+                            st.rerun()
+            
+                    with col_btn3:
+                        # Botão para Salvar as alterações feitas na tabela do carrinho
+                        if st.button("💾 Salvar", key="btn_salvar_carrinho_admin"):
+                            try:
+                                # Procura dinamicamente por qualquer tabela editada ativa na sessão do Streamlit
+                                df_editado = None
+                                for chave_sessao in st.session_state:
+                                    if "tabela" in chave_sessao or "carrinho" in chave_sessao or "editor" in chave_sessao:
+                                        obj = st.session_state[chave_sessao]
+                                        if hasattr(obj, "to_dict"):
+                                            df_editado = obj
+                                            break
+                                
+                                if df_editado is not None and hasattr(df_editado, 'to_dict'):
+                                    nova_lista = df_editado.to_dict(orient='records')
+                                    
+                                    # Recalcula os valores totais dos itens
+                                    for item in nova_lista:
+                                        qtd = float(item.get("quantidade", 1) or 1)
+                                        v_unit = float(item.get("valor_unitario", item.get("preco_unitario", 0)) or 0)
+                                        item["quantidade"] = qtd
+                                        item["valor_unitario"] = v_unit
+                                        item["preco_unitario"] = v_unit
+                                        item["valor_total"] = qtd * v_unit
+                                        
+                                    st.session_state.carrinho_cliente = nova_lista
+                                    st.success("✅ Alterações guardadas com sucesso!")
+                                    st.rerun()
+                                else:
+                                    # Se os dados já estão no estado, apenas força o recarregamento com sucesso
+                                    st.success("✅ Alterações guardadas com sucesso!")
+                                    st.rerun()
+                            except Exception as e:
+                                st.error(f"Erro ao salvar alterações: {e}")
+                            else:
+                                st.warning("Clique em '✏️ Alterar' primeiro para editar a tabela.")
+            
+                    with col_btn4:
+                        if st.button("🔴 Finalizar e Enviar Pedido", type="primary", use_container_width=True, key="btn_finalizar_pedido_v2"):
+                            try:
+                                cursor = conn.cursor()
+                                import zoneinfo
+                                data_agora = dt.datetime.now(zoneinfo.ZoneInfo("America/Sao_Paulo")).strftime("%Y-%m-%d %H:%M:%S")
+                    
+                                for item in carrinho_atual:
+                                    qtd_item = float(item.get("quantidade", 1))
+                                    prod_nome = str(item.get("produto", ""))
+                                    val_unit = float(item.get("valor_unitario", 0))
+                                    val_tot = float(item.get("valor_total", 0))
+                                    forn_nome = item.get("fornecedor", "")
+                                    grupo_nome = item.get("grupo", "")
+                    
+                                    # 1. Grava APENAS no histórico de pedidos como Pendente
+                                    cursor.execute("""
+                                        INSERT INTO pedidos (cliente, produto, fornecedor, grupo, quantidade, valor_unitario, valor_total, status, data)
+                                        VALUES (?, ?, ?, ?, ?, ?, ?, 'Pendente', ?)
+                                    """, (cliente_ped, prod_nome, forn_nome, grupo_nome, qtd_item, val_unit, val_tot, data_agora))
+                    
+                                conn.commit()
+                    
+                                # Limpa os carrinhos da sessão
+                                if 'carrinho_admin' in st.session_state:
+                                    st.session_state.carrinho_admin = []
+                                if 'carrinho' in st.session_state:
+                                    st.session_state.carrinho = []
+                                if 'carrinho_cliente' in st.session_state:
+                                    st.session_state.carrinho_cliente = []
+                    
+                                st.session_state.modo_edicao_carrinho = False
+                                st.cache_data.clear()
+                                st.success("✅ Pedido enviado com sucesso! Aguardando conversão em venda.")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Erro ao salvar pedido: {e}")
+                else:
+                    st.info("Nenhum item adicionado ao carrinho ainda.")
+        
+            with aba_list:
+                st.subheader("🟢 Pedidos do Dia Pendentes (Editáveis)")
+            
+                df_todos_pedidos = carregar_dados("SELECT * FROM pedidos WHERE status = 'PENDENTE' OR status = 'Pendente' ORDER BY id DESC")
+            
+                if not df_todos_pedidos.empty:
+                    df_filtrado = df_todos_pedidos.copy()
+            
+                    if 'Excluir' not in df_filtrado.columns:
+                        df_filtrado.insert(0, 'Excluir', False)
+            
+                    if 'data' in df_filtrado.columns:
+                        df_filtrado['data_formatada'] = df_filtrado['data'].astype(str).str.slice(0, 10)
+            
+                    col_f1, col_f2, col_f3, col_f4 = st.columns(4)
+            
+                    lista_cli = ["Todos"] + sorted(list(df_filtrado['cliente'].dropna().astype(str).unique())) if 'cliente' in df_filtrado.columns else ["Todos"]
+                    lista_forn = ["Todos"] + sorted(list(df_filtrado['fornecedor'].dropna().astype(str).unique())) if 'fornecedor' in df_filtrado.columns else ["Todos"]
+                    lista_grp = ["Todos"] + sorted(list(df_filtrado['grupo'].dropna().astype(str).unique())) if 'grupo' in df_filtrado.columns else ["Todos"]
+            
+                    with col_f1:
+                        f_cli = st.selectbox("Filtrar por Cliente:", lista_cli, key="f_cli_pedidos")
+                    with col_f2:
+                        f_forn = st.selectbox("Filtrar por Fornecedor:", lista_forn, key="f_forn_pedidos")
+                    with col_f3:
+                        f_grp = st.selectbox("Filtrar por Grupo:", lista_grp, key="f_grp_pedidos")
+                    with col_f4:
+                        f_data = st.date_input("Filtrar por Data:", value=None, key="f_data_pedidos")
+            
+                    if f_cli != "Todos":
+                        df_filtrado = df_filtrado[df_filtrado['cliente'].astype(str) == str(f_cli)]
+                    if f_forn != "Todos":
+                        df_filtrado = df_filtrado[df_filtrado['fornecedor'].astype(str) == str(f_forn)]
+                    if f_grp != "Todos":
+                        df_filtrado = df_filtrado[df_filtrado['grupo'].astype(str) == str(f_grp)]
+                    if f_data is not None and 'data_formatada' in df_filtrado.columns:
+                        df_filtrado = df_filtrado[df_filtrado['data_formatada'] == str(f_data)]
+            
+                    if not df_filtrado.empty:
+                        cols_exibir = [c for c in df_filtrado.columns if c != 'data_formatada']
+                        
+                        st.caption("💡 *Edite os dados diretamente na tabela abaixo ou marque a caixa 'Excluir' para remover.*")
+                        
+                        df_editado = st.data_editor(
+                            df_filtrado[cols_exibir],
+                            disabled=["id", "data"],
+                            use_container_width=True,
+                            column_config={
+                                "valor_unitario": st.column_config.NumberColumn("Valor Unitário", format="R$ %.2f"),
+                                "valor_total": st.column_config.NumberColumn("Valor Total", format="R$ %.2f")
+                            },
+                            key="editor_pedidos_dia"
+                        )
+            
+                        col_b1, col_b2, col_b3 = st.columns(3)
+            
+                        with col_b1:
+                            if st.button("💾 Salvar Alterações", type="primary", key="btn_salvar_edicoes_pedidos"):
+                                try:
+                                    cursor = conn.cursor()
+                                    for _, row in df_editado.iterrows():
+                                        ped_id = row['id']
+                                        qtd = float(row.get('quantidade', 1))
+                                        v_unit = float(row.get('valor_unitario', 0.0))
+                                        v_tot = qtd * v_unit
+                                        cli = str(row.get('cliente', '')).strip()
+                                        prod = str(row.get('produto', '')).strip()
+                                        fornec = str(row.get('fornecedor', '')).strip()
+                                        grp = str(row.get('grupo', '')).strip()
+                                        stts = str(row.get('status', 'PENDENTE')).strip()
+            
+                                        cursor.execute("UPDATE pedidos SET cliente = ?, produto = ?, quantidade = ?, valor_unitario = ?, valor_total = ?, fornecedor = ?, grupo = ?, status = ? WHERE id = ?", (cli, prod, qtd, v_unit, v_tot, fornec, grp, stts, ped_id))
+            
+                                    conn.commit()
+                                    st.cache_data.clear()
+                                    st.success("✅ Alterações salvas com sucesso!")
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"Erro ao salvar alterações: {e}")
+                            if st.button("🔄 Atualizar Preços dos Pedidos com o Estoque", key="btn_atualizar_precos_pedidos"):
+                                try:
+                                    with conn:
+                                        cursor = conn.cursor()
+                                        cursor.execute("UPDATE pedidos SET valor_unitario = (SELECT valor_venda FROM produtos WHERE produtos.produto = pedidos.produto), valor_total = quantidade * (SELECT valor_venda FROM produtos WHERE produtos.produto = pedidos.produto) WHERE status = 'Pendente' AND EXISTS (SELECT 1 FROM produtos WHERE produtos.produto = pedidos.produto)")
+                                    st.cache_data.clear()
+                                    st.success("✅ Preços dos pedidos pendentes atualizados com o estoque com sucesso!")
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"Erro ao atualizar preços dos pedidos: {e}")
+                        with col_b2:
+                            if st.button("🗑️ Excluir Marcados", type="secondary", key="btn_excluir_pedidos_marcados"):
+                                try:
+                                    pedidos_para_excluir = df_editado[df_editado['Excluir'] == True]['id'].tolist()
+                                    if pedidos_para_excluir:
+                                        cursor = conn.cursor()
+                                        cursor.executemany("DELETE FROM pedidos WHERE id = ?", [(pid,) for pid in pedidos_para_excluir])
+                                        conn.commit()
+                                        st.cache_data.clear()
+                                        st.success(f"✅ {len(pedidos_para_excluir)} pedido(s) excluído(s)!")
+                                        st.rerun()
+                                    else:
+                                        st.warning("Nenhum pedido marcado na coluna 'Excluir'.")
+                                except Exception as e:
+                                    st.error(f"Erro ao excluir pedido(s): {e}")
+            
+                        with col_b3:
+                            try:
+                                df_pdf = df_editado.drop(columns=['Excluir'], errors='ignore')
+                                pdf_buf = gerar_pdf_tabela_pedidos(df_pdf, cliente_nome=f_cli)
+                                nome_arq = f"relatorio_pedidos_{f_cli.lower().replace(' ', '_')}.pdf" if f_cli != "Todos" else "relatorio_pedidos_geral.pdf"
+                                
+                                st.download_button(
+                                    label="📄 Baixar PDF do Dia",
+                                    data=pdf_buf.getvalue(),
+                                    file_name=nome_arq,
+                                    mime="application/pdf",
+                                    key="btn_pdf_dia_admin_v7"
+                                )
+                            except Exception as e:
+                                st.error(f"Erro ao gerar PDF: {e}")
+            
+                    else:
+                        st.warning("Nenhum pedido pendente encontrado com os filtros selecionados.")
+                else:
+                    st.info("Nenhum pedido pendente registrado no sistema.")
+            
+                st.divider()
+                st.subheader("💳 Confirmar Recebimento / Dar Baixa no Pedido")
+            
+                df_baixa = carregar_dados("SELECT * FROM pedidos WHERE status = 'PENDENTE' OR status = 'Pendente'")
+            
+                if not df_baixa.empty:
+                    clientes_com_pendencia = sorted(list(df_baixa['cliente'].dropna().astype(str).unique()))
+                    cliente_sel_baixa = st.selectbox("Selecione o Cliente:", clientes_com_pendencia, key="sel_cli_baixa_pedidos")
+            
+                    df_cli_pedidos = df_baixa[df_baixa['cliente'].astype(str) == str(cliente_sel_baixa)].copy()
+            
+                    if not df_cli_pedidos.empty:
+                        st.dataframe(df_cli_pedidos, use_container_width=True)
+            
+                        valor_total_debito = float(df_cli_pedidos['valor_total'].sum())
+                        st.info(f"💳 **Débito Total Atual de {cliente_sel_baixa}: R$ {valor_total_debito:.2f}**")
+            
+                        col_p1, col_p2, col_p3 = st.columns([2, 2, 2])
+                        with col_p1:
+                            forma_pagamento = st.selectbox("Forma de Pagamento:", ["Dinheiro", "Pix", "Cartão de Crédito", "Cartão de Débito", "Crediário / Fiado"], key="fp_baixa_pedido")
+                        with col_p2:
+                            valor_recebido = st.number_input("Valor Recebido / Entrada (R$):", min_value=0.0, value=0.0 if forma_pagamento == "Crediário / Fiado" else float(valor_total_debito), step=1.0, key="vr_baixa_pedido")
+                        with col_p3:
+                            troco = valor_recebido - valor_total_debito if valor_recebido > valor_total_debito else 0.0
+                            st.markdown(f"**Troco:**\n### R$ {troco:.2f}")
+            
+                        detalhe_pagamento = forma_pagamento
+                        if forma_pagamento == "Crediário / Fiado":
+                            st.markdown("---")
+                            st.subheader("📅 Configuração das Parcelas do Crediário")
+                            
+                            valor_pendente = max(0.0, valor_total_debito - valor_recebido)
+                            
+                            col_parc1, col_parc2 = st.columns(2)
+                            with col_parc1:
+                                num_parcelas = st.number_input("Quantidade de Parcelas:", min_value=1, max_value=24, value=1, step=1, key="num_parc_fiado")
+                            with col_parc2:
+                                st.metric("Valor Total a Parcelar", f"R$ {valor_pendente:.2f}")
+            
+                            st.write("**Defina os Valores e Datas de Vencimento das Parcelas:**")
+                            
+                            val_sugerido_padrao = round(valor_pendente / int(num_parcelas), 2) if num_parcelas > 0 else 0.0
+                            parcelas_info = []
+            
+                            for i in range(int(num_parcelas)):
+                                col_v1, col_v2 = st.columns(2)
+                                with col_v1:
+                                    val_parc_input = st.number_input(f"Valor Parcela {i+1} (R$):", min_value=0.0, value=float(val_sugerido_padrao), step=1.0, key=f"val_parc_{i}")
+                                with col_v2:
+                                    data_sugerida = dt.date.today() + dt.timedelta(days=30 * (i + 1))
+                                    dt_input = st.date_input(f"Venc. Parcela {i+1}:", value=data_sugerida, key=f"dt_venc_parc_{i}")
+                                
+                                parcelas_info.append(f"P{i+1}: R$ {val_parc_input:.2f} ({dt_input.strftime('%d/%m/%Y')})")
+            
+                            detalhe_pagamento = f"Crediário ({num_parcelas}x | " + ", ".join(parcelas_info) + ")"
+            
+                        if st.button("🔄 Converter Pedido em Venda (Fiado / Baixa)", type="primary", key="btn_converter_pedido_venda"):
+                            try:
+                                cursor = conn.cursor()
+                                codigo_venda_gerado = f"PED-{dt.datetime.now().strftime('%Y%m%d%H%M%S')}"
+            
+                                for _, r in df_cli_pedidos.iterrows():
+                                    item_tot = float(r.get('valor_total', 0.0))
+                                    qtd_item = float(r.get('quantidade', 1))
+                                    
+                                    if valor_total_debito > 0:
+                                        item_rec = round((item_tot / valor_total_debito) * valor_recebido, 2)
+                                    else:
+                                        item_rec = 0.0
+                                    
+                                    item_rest = round(max(0.0, item_tot - item_rec), 2)
+            
+                                    cursor.execute("DELETE FROM vendas WHERE cliente = ? AND produto = ? AND (forma_pagamento = '-' OR forma_pagamento IS NULL OR forma_pagamento = 'None')", (str(r['cliente']), str(r['produto'])))
+                                    cursor.execute("UPDATE produtos SET quantidade = quantidade - ? WHERE produto = ?", (qtd_item, str(r['produto'])))
+                                    cursor.execute("INSERT INTO vendas (cliente, produto, fornecedor, quantidade, valor_venda, valor_total, forma_pagamento, valor_recebido, troco, restante, data, grupo, codigo_venda, status, tipo, codigo) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (
+                                        str(r['cliente']), str(r['produto']), str(r.get('fornecedor', '')), qtd_item, float(r.get('valor_unitario', 0)), item_tot, detalhe_pagamento, item_rec, 0.0, item_rest, dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), str(r.get('grupo', '')), codigo_venda_gerado, "Concluído", "PEDIDO", f"PED-{r['id']}"
+                                    ))
+                                    cursor.execute("UPDATE pedidos SET status = 'Concluído (Convertido)' WHERE id = ?", (r['id'],))
+            
+                                conn.commit()
+                                if 'executar_limpeza_banco' in globals():
+                                    executar_limpeza_banco()
+            
+                                st.cache_data.clear()
+                                st.success(f"✅ Pedido(s) de {cliente_sel_baixa} convertidos e estoque atualizado com sucesso!")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Erro ao dar baixa no pedido: {e}")
+                    else:
+                        st.info("Nenhum pedido pendente para este cliente.")
+                else:
+                    st.info("Nenhum cliente possui pedidos pendentes para dar baixa no momento.")
+            
+                st.divider()
+                st.subheader("📚 Pedidos Anteriores / Histórico Geral")
+            
+                df_historico = carregar_dados("SELECT id, cliente, produto, fornecedor, quantidade, valor_venda, valor_total, forma_pagamento, valor_recebido, troco, restante, data, grupo FROM vendas ORDER BY id DESC")
+            
+                if not df_historico.empty:
+                    df_historico['forma_pagamento'] = df_historico['forma_pagamento'].fillna('-').replace({'None': '-', '': '-'})
+                    for c in ['valor_recebido', 'troco', 'restante']:
+                        df_historico[c] = pd.to_numeric(df_historico[c], errors='coerce').fillna(0.0)
+            
+                    st.dataframe(df_historico, use_container_width=True)
+            
+                    col_hist1, col_hist2 = st.columns([1, 4])
+                    with col_hist1:
+                        if st.button("🗑️ Limpar Todo o Histórico", type="secondary", key="btn_limpar_historico"):
+                            try:
+                                cursor = conn.cursor()
+                                cursor.execute("DELETE FROM vendas")
+                                cursor.execute("DELETE FROM pedidos WHERE status LIKE '%Concluído%' OR status LIKE '%Convertido%'")
+                                conn.commit()
+                                st.cache_data.clear()
+                                st.success("✅ Histórico limpo com sucesso!")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Erro ao limpar histórico: {e}")
+                else:
+                    st.info("Nenhum registro encontrado.")
+        elif "Contas a Receber" in str(menu_admin):
+            st.title("💸 Contas a Receber")
+            st.markdown("Gerencie de forma centralizada todos os valores pendentes e saldos devedores dos clientes.")
+            
+            # Bloco para carregar todos os pedidos da base de dados de forma segura
+            try:
+                df_contas = pd.read_sql_query("SELECT * FROM pedidos", conn)
+            except Exception:
+                df_contas = pd.DataFrame()
+            
+            if not df_contas.empty:
+                # Padroniza colunas numéricas de forma segura
+                for col in ['valor_total', 'valor_recebido', 'restante', 'quantidade', 'valor_unitario']:
+                    if col in df_contas.columns:
+                        df_contas[col] = pd.to_numeric(df_contas[col], errors='coerce').fillna(0.0)
+            
+                # Define o valor devedor com base na coluna restante ou no cálculo total - recebido
+                if 'restante' in df_contas.columns:
+                    df_contas['valor_devedor'] = df_contas['restante']
+                elif 'valor_total' in df_contas.columns and 'valor_recebido' in df_contas.columns:
+                    df_contas['valor_devedor'] = df_contas['valor_total'] - df_contas['valor_recebido']
+                elif 'valor_total' in df_contas.columns:
+                    df_contas['valor_devedor'] = df_contas['valor_total']
+                else:
+                    df_contas['valor_devedor'] = 0.0
+            
+                # Filtra apenas os registos que realmente possuem débito pendente (> 0)
+                df_contas = df_contas[df_contas['valor_devedor'] > 0]
+            
+            if not df_contas.empty:
+                col_f1, col_f2 = st.columns(2)
+                with col_f1:
+                    clientes_disponiveis = ["Todos"] + sorted(df_contas['cliente'].dropna().unique().tolist()) if 'cliente' in df_contas.columns else ["Todos"]
+                    filtro_cliente_cr = st.selectbox("Filtrar por Cliente:", clientes_disponiveis, key="select_cliente_contas_receber")
+                
+                with col_f2:
+                    st.markdown("<br>", unsafe_allow_html=True)
+                    termo_busca_cr = st.text_input("🔍 Pesquisa rápida:", placeholder="Digite o produto ou detalhe...", key="busca_cr_livre")
+            
+                df_filtrado = df_contas.copy()
+                if filtro_cliente_cr != "Todos" and 'cliente' in df_filtrado.columns:
+                    df_filtrado = df_filtrado[df_filtrado['cliente'] == filtro_cliente_cr]
+                    
+                if termo_busca_cr.strip() and 'produto' in df_filtrado.columns:
+                    df_filtrado = df_filtrado[df_filtrado['produto'].astype(str).str.contains(termo_busca_cr, case=False, na=False)]
+            
+                total_a_receber = df_filtrado['valor_devedor'].sum()
+                total_clientes_devedores = df_filtrado['cliente'].nunique() if 'cliente' in df_filtrado.columns else 0
+            
+                st.markdown("---")
+                col_m1, col_m2 = st.columns(2)
+                with col_m1:
+                    st.metric("💰 Total Geral a Receber", f"R$ {total_a_receber:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
+                with col_m2:
+                    st.metric("👥 Clientes com Pendências", str(total_clientes_devedores))
+            
+                st.markdown("---")
+                st.subheader("📋 Lista de Contas Pendentes")
+            
+                colunas_exibir = [c for c in ['id', 'cliente', 'produto', 'quantidade', 'valor_total', 'valor_recebido', 'restante', 'data'] if c in df_filtrado.columns]
+                if not colunas_exibir:
+                    colunas_exibir = df_filtrado.columns.tolist()
+            
+                st.dataframe(
+                    df_filtrado[colunas_exibir],
+                    use_container_width=True,
+                    hide_index=True
+                )
+            
+                if st.button("🔄 Atualizar Dados de Contas a Receber", key="btn_refresh_cr"):
+                    st.rerun()
+            
+            else:
+                st.info("ℹ️ Não existem contas a receber registadas ou todos os pedidos já se encontram quitados.")
+        elif menu_admin == "📦 Estoque de Produtos":
+            st.title("📦 Estoque de Produtos e Preços")
+        
+            # --- IMPORTAÇÃO DIRETA PELA TELA DA APLICAÇÃO ---
+            with st.expander("📥 Importar / Colar Lista de Produtos em Massa"):
+                st.info("Cole abaixo a sua lista copiada diretamente do Excel ou Bloco de Notas.")
+                
+                texto_lista_colada = st.text_area(
+                    "Cole os produtos aqui:",
+                    placeholder="Exemplo:\n1\tABACATE\t6\tBAHIA\tGERAL\t0\t0",
+                    key="input_texto_produtos_massa"
+                )
+                
+                if st.button("🚀 Processar e Importar Lista Colada"):
+                    if not texto_lista_colada.strip():
+                        st.warning("⚠️ Por favor, cole os dados na caixa de texto acima antes de importar.")
+                    else:
+                        try:
+                            cursor = conn.cursor()
+                            linhas = texto_lista_colada.strip().split("\n")
+                            sucessos = 0
+                            
+                            for linha in linhas:
+                                if not linha.strip():
+                                    continue
+                                
+                                # Divide a linha rigorosamente por tabulação (formato de tabela copiada)
+                                partes = linha.split("\t")
+                                if len(partes) < 2:
+                                    # Fallback caso venha com espaços normais
+                                    partes = linha.strip().split()
+                                    
+                                # Mapeia as colunas com base na estrutura (ID, Produto, Qtd, Fornecedor, Grupo, V.Compra, V.Venda)
+                                if len(partes) >= 7:
+                                    prod = partes[1].strip().upper()
+                                    qtd = float(partes[2].strip().replace(',', '.') or 0.0)
+                                    forn = partes[3].strip().upper()
+                                    grupo = partes[4].strip().upper()
+                                    v_compra = float(partes[5].strip().replace(',', '.') or 0.0)
+                                    v_venda = float(partes[6].strip().replace(',', '.') or 0.0)
+                                elif len(partes) >= 6:
+                                    prod = partes[0].strip().upper()
+                                    qtd = float(partes[1].strip().replace(',', '.') or 0.0)
+                                    forn = partes[2].strip().upper()
+                                    grupo = partes[3].strip().upper()
+                                    v_compra = float(partes[4].strip().replace(',', '.') or 0.0)
+                                    v_venda = float(partes[5].strip().replace(',', '.') or 0.0)
+                                else:
+                                    continue
+                                    
+                                # Insere ou atualiza de forma limpa usando a restrição OR REPLACE
+                                cursor.execute("""
+                                    INSERT OR REPLACE INTO produtos (produto, grupo, fornecedor, quantidade, valor_compra, valor_venda)
+                                    VALUES (?, ?, ?, ?, ?, ?)
+                                """, (prod, grupo, forn, qtd, v_compra, v_venda))
+                                sucessos += 1
+                                
+                            conn.commit()
+                            if sucessos > 0:
+                                st.success(f"✅ {sucessos} produtos importados/atualizados com sucesso!")
+                                st.rerun()
+                            else:
+                                st.warning("⚠️ Nenhum produto válido foi detetado. Verifique o formato do texto colado.")
+                        except Exception as e:
+                            st.error(f"Erro ao processar a lista: {e}")
+        
+            try:
+                df_produtos = pd.read_sql_query("SELECT * FROM produtos", conn)
+            except Exception:
+                df_produtos = pd.DataFrame()
+        
+            # Filtro de stock
+            filtro_estoque = st.selectbox(
+                "Filtrar por Status do Stock:",
+                ["Todos", "Com Stock (> 0)", "Zerados (= 0)"],
+                key="filtro_status_stock"
+            )
+        
+            cols_esperadas = ['id', 'produto', 'quantidade', 'fornecedor', 'grupo', 'valor_compra', 'valor_venda']
+            for c in cols_esperadas:
+                if c not in df_produtos.columns:
+                    df_produtos[c] = 0.0 if ('valor' in c or 'quantidade' in c) else ""
+        
+            if not df_produtos.empty:
+                cols_finais = [c for c in cols_esperadas if c in df_produtos.columns]
+                df_produtos = df_produtos[cols_finais]
+                
+                # Aplica o filtro de quantidade de forma segura
+                df_produtos['quantidade'] = pd.to_numeric(df_produtos['quantidade'], errors='coerce').fillna(0)
+                
+                if filtro_estoque == "Com Stock (> 0)":
+                    df_produtos = df_produtos[df_produtos['quantidade'] > 0]
+                elif filtro_estoque == "Zerados (= 0)":
+                    df_produtos = df_produtos[df_produtos['quantidade'] == 0]
+    
+            df_estoque_editado = st.data_editor(df_produtos, use_container_width=True, hide_index=True, key="editor_estoque_produtos")
+    
+            col_salvar, col_atualizar, col_pdf = st.columns([1, 1, 1])
+    
+            with col_salvar:
+                if st.button("💾 Salvar Alterações no Estoque", type="primary", key="btn_salvar_estoque"):
+                    try:
+                        cursor = conn.cursor()
+                        for col in ["grupo", "fornecedor"]:
+                            try:
+                                cursor.execute(f"ALTER TABLE produtos ADD COLUMN {col} TEXT")
+                            except Exception:
+                                pass
+    
+                        for _, row in df_estoque_editado.iterrows():
+                            cursor.execute("""
+                                UPDATE produtos 
+                                SET produto = ?, quantidade = ?, valor_compra = ?, valor_venda = ?, grupo = ?, fornecedor = ? 
+                                WHERE id = ?
+                            """, (str(row['produto']).strip(), float(row['quantidade']), float(row['valor_compra']), float(row['valor_venda']), str(row.get('grupo', '')), str(row.get('fornecedor', '')), int(row['id'])))
+    
+                        conn.commit()
+                        st.cache_data.clear()
+                        st.success("✅ Alterações do estoque salvas com sucesso!")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Erro ao salvar: {e}")
+    
+            with col_atualizar:
+                if st.button("🔄 Atualizar Preços de Compra", key="btn_atualizar_precos"):
+                    try:
+                        with conn:
+                            cursor = conn.cursor()
+                            cursor.execute("UPDATE produtos SET valor_compra = (SELECT valor_compra FROM compras WHERE compras.produto = produtos.produto ORDER BY id DESC LIMIT 1) WHERE EXISTS (SELECT 1 FROM compras WHERE compras.produto = produtos.produto)")
+                        st.cache_data.clear()
+                        st.success("✅ Preços de compra atualizados com sucesso!")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Erro ao atualizar preço: {e}")
+
+            with col_pdf:
+                # --- BOTÃO PARA GERAR PDF DO ESTOQUE COM TOTAIS ---
+                try:
+                    import io
+                    from reportlab.lib.pagesizes import letter
+                    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+                    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+                    from reportlab.lib import colors
+
+                    def gerar_pdf_estoque(df_dados):
+                        buffer = io.BytesIO()
+                        doc = SimpleDocTemplate(buffer, pagesize=letter, rightMargin=30, leftMargin=30, topMargin=30, bottomMargin=30)
+                        elements = []
+                        styles = getSampleStyleSheet()
+                        
+                        title_style = ParagraphStyle(
+                            'TitleStyle',
+                            parent=styles['Heading1'],
+                            fontSize=16,
+                            textColor=colors.HexColor('#1f2937'),
+                            spaceAfter=5,
+                            alignment=1
+                        )
+                        
+                        sub_style = ParagraphStyle(
+                            'SubStyle',
+                            parent=styles['Normal'],
+                            fontSize=10,
+                            textColor=colors.HexColor('#4b5563'),
+                            spaceAfter=15,
+                            alignment=1
+                        )
+                        
+                        elements.append(Paragraph("Relatório de Estoque de Produtos e Preços", title_style))
+                        
+                        # Calcula os valores totais (Quantidade * Valor)
+                        total_compra = 0.0
+                        total_venda = 0.0
+                        
+                        for _, row in df_dados.iterrows():
+                            try:
+                                qtd = float(str(row.get('quantidade', 0)).replace(',', '.') or 0.0)
+                                v_compra = float(str(row.get('valor_compra', 0)).replace(',', '.') or 0.0)
+                                v_venda = float(str(row.get('valor_venda', 0)).replace(',', '.') or 0.0)
+                                
+                                total_compra += qtd * v_compra
+                                total_venda += qtd * v_venda
+                            except:
+                                pass
+                                
+                        # Formata o texto dos totais para exibir no PDF
+                        texto_totais = f"<b>Valor Total de Compras:</b> R$ {total_compra:,.2f} &nbsp;&nbsp;|&nbsp;&nbsp; <b>Valor Total de Vendas:</b> R$ {total_venda:,.2f}"
+                        elements.append(Paragraph(texto_totais, sub_style))
+                        elements.append(Spacer(1, 5))
+                        
+                        # Cabeçalho e dados da tabela
+                        data = [["ID", "Produto", "Qtd", "Fornecedor", "Grupo", "V. Compra", "V. Venda"]]
+                        for _, row in df_dados.iterrows():
+                            data.append([
+                                str(row.get('id', '')),
+                                str(row.get('produto', '')),
+                                str(row.get('quantidade', '')),
+                                str(row.get('fornecedor', '')),
+                                str(row.get('grupo', '')),
+                                f"R$ {float(str(row.get('valor_compra', 0)).replace(',', '.') or 0):.2f}",
+                                f"R$ {float(str(row.get('valor_venda', 0)).replace(',', '.') or 0):.2f}"
+                            ])
+                            
+                        t = Table(data, colWidths=[35, 170, 50, 85, 75, 60, 60])
+                        t.setStyle(TableStyle([
+                            ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#374151')),
+                            ('TEXTCOLOR', (0,0), (-1,0), colors.white),
+                            ('ALIGN', (0,0), (-1,-1), 'LEFT'),
+                            ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
+                            ('FONTSIZE', (0,0), (-1,0), 9),
+                            ('BOTTOMPADDING', (0,0), (-1,0), 6),
+                            ('BACKGROUND', (0,1), (-1,-1), colors.HexColor('#f9fafb')),
+                            ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor('#d1d5db')),
+                            ('FONTNAME', (0,1), (-1,-1), 'Helvetica'),
+                            ('FONTSIZE', (0,1), (-1,-1), 8),
+                        ]))
+                        
+                        elements.append(t)
+                        doc.build(elements)
+                        buffer.seek(0)
+                        return buffer.getvalue()
+
+                    pdf_estoque_bytes = gerar_pdf_estoque(df_estoque_editado)
+                    
+                    st.download_button(
+                        label="📄 Gerar PDF do Estoque",
+                        data=pdf_estoque_bytes,
+                        file_name="relatorio_estoque.pdf",
+                        mime="application/pdf",
+                        key="btn_baixar_pdf_estoque"
+                    )
+                except Exception as e_pdf_est:
+                    st.error(f"Erro ao gerar PDF: {e_pdf_est}")
+        elif menu_admin == "👥 Cadastros (Clientes / Fornecedores / Grupos)":
+            st.title("👥 Cadastros Gerais")
+            tab_cli, tab_prod, tab_forn, tab_grup = st.tabs(["👤 Clientes", "📦 Produtos", "🏢 Fornecedores", "🏷️ Grupos"])
+    
+            with tab_cli:
+                st.subheader("👤 Gerenciamento de Clientes")
+    
+                with st.form("form_cadastrar_cliente", clear_on_submit=True):
+                    col_cli1, col_cli2 = st.columns(2)
+                    with col_cli1:
+                        txt_nome_cli = st.text_input("Nome do Cliente / Razão Social", key="cli_nome_cad")
+                        txt_doc_cli = st.text_input("CPF / CNPJ", key="cli_doc_cad")
+                        txt_cidade_cli = st.text_input("Cidade / Email", key="cli_cidade_cad")
+                    with col_cli2:
+                        txt_tel_cli = st.text_input("Telefone / WhatsApp", key="cli_tel_cad")
+                        txt_end_cli = st.text_input("Endereço", key="cli_end_cad")
+    
+                    btn_salvar_cli = st.form_submit_button("💾 Salvar Cliente")
+                    if btn_salvar_cli:
+                        if not txt_nome_cli.strip():
+                            st.warning("Por favor, informe o nome do cliente.")
+                        else:
+                            sucesso, msg = salvar_cliente_completo(txt_nome_cli, txt_tel_cli, txt_doc_cli, txt_end_cli, txt_cidade_cli)
+                            if sucesso:
+                                st.success(msg)
+                                st.rerun()
+                            else:
+                                st.error(msg)
+    
+                st.markdown("---")
+                st.subheader("Lista de Clientes")
+                df_cli_view = carregar_dados("SELECT * FROM clientes")
+                if not df_cli_view.empty:
+                    st.dataframe(df_cli_view, use_container_width=True)
+                    st.markdown("---")
+                    st.subheader("⚙️ Gerir Clientes Selecionados")
+                    if 'id' in df_cli_view.columns:
+                        lista_ids = df_cli_view['id'].tolist()
+                        id_selecionado = st.selectbox("Selecione o ID do Cliente para Atualizar ou Excluir", lista_ids, key="sel_cli_gerir")
+                        
+                        cli_atual = df_cli_view[df_cli_view['id'] == id_selecionado].iloc[0]
+                        nome_atual = str(cli_atual.get('cliente', '')) if pd.notna(cli_atual.get('cliente')) else str(cli_atual.get('nome', ''))
+                        cpf_atual = str(cli_atual.get('cpf', '')) if pd.notna(cli_atual.get('cpf')) else ''
+                        end_atual = str(cli_atual.get('endereco', '')) if pd.notna(cli_atual.get('endereco')) else ''
+                        email_atual = str(cli_atual.get('email', '')) if pd.notna(cli_atual.get('email')) else ''
+                        fone_atual = str(cli_atual.get('fone', '')) if pd.notna(cli_atual.get('fone')) else ''
+                        cidade_atual = str(cli_atual.get('cidade', '')) if pd.notna(cli_atual.get('cidade')) else ''
+            
+                        with st.form("form_gerir_cliente"):
+                            novo_nome = st.text_input("Nome / Cliente", value=nome_atual)
+                            novo_cpf = st.text_input("CPF / DOC", value=cpf_atual)
+                            novo_end = st.text_input("Endereço", value=end_atual)
+                            novo_email = st.text_input("E-mail", value=email_atual)
+                            novo_fone = st.text_input("Telefone / Fone", value=fone_atual)
+                            novo_cidade = st.text_input("Cidade", value=cidade_atual)
+                            
+                            col_b1, col_b2 = st.columns(2)
+                            with col_b1:
+                                btn_atualizar = st.form_submit_button("🔄 Atualizar Cliente", type="primary")
+                            with col_b2:
+                                btn_excluir = st.form_submit_button("🗑️ Excluir Cliente", type="secondary")
+                                
+                            if btn_atualizar:
+                                cursor = conn.cursor()
+                                cursor.execute("UPDATE clientes SET cliente = ?, nome = ?, cpf = ?, endereco = ?, email = ?, fone = ?, cidade = ? WHERE id = ?", (novo_nome, novo_nome, novo_cpf, novo_end, novo_email, novo_fone, novo_cidade, id_selecionado))
+                                conn.commit()
+                                st.success("Cliente atualizado com sucesso!")
+                                st.rerun()
+                                
+                            if btn_excluir:
+                                cursor = conn.cursor()
+                                cursor.execute("DELETE FROM clientes WHERE id = ?", (id_selecionado,))
+                                conn.commit()
+                                st.success("Cliente excluído com sucesso!")
+                                st.rerun()
+
+                        # -----------------------------------------------------------------------------
+                        # EXTRATO FINANCEIRO & HISTÓRICO DO CLIENTE (STATUS CORRIGIDO)
+                        # -----------------------------------------------------------------------------
+                        st.markdown("---")
+                        st.markdown(f"### 💰 Extrato Financeiro: {nome_atual}")
+                        
+                        try:
+                            from datetime import datetime
+                            from zoneinfo import ZoneInfo
+                            from fpdf import FPDF
+                            import pandas as pd
+                            
+                            query_financeiro = """
+                                SELECT *
+                                FROM vendas
+                                WHERE cliente = ?
+                                ORDER BY id DESC
+                            """
+                            df_fin_cliente = pd.read_sql_query(query_financeiro, conn, params=(nome_atual,))
+                        
+                            if not df_fin_cliente.empty:
+                                if 'status' in df_fin_cliente.columns:
+                                    df_fin_cliente['status_limpo'] = df_fin_cliente['status'].astype(str).str.strip().str.capitalize()
+                                else:
+                                    df_fin_cliente['status_limpo'] = 'Concluído'
+                        
+                                def verificar_em_aberto(row):
+                                    status = str(row.get('status_limpo', '')).lower()
+                                    if status == 'quitado':
+                                        return False
+                                    if status == 'parcial':
+                                        restante_val = float(row.get('restante', 0.0) or 0.0)
+                                        return restante_val > 0
+                                    
+                                    fp = str(row.get('forma_pagamento', '')).lower()
+                                    termos = ['crediário', 'crediario', 'fiado', 'prazo', 'p1:', 'p1', 'parcial']
+                                    return any(termo in fp for termo in termos)
+                        
+                                df_fin_cliente['is_aberto'] = df_fin_cliente.apply(verificar_em_aberto, axis=1)
+                        
+                                df_abertos = df_fin_cliente[df_fin_cliente['is_aberto'] == True]
+                                df_quitados = df_fin_cliente[df_fin_cliente['is_aberto'] == False]
+                        
+                                total_falta_pagar = 0.0
+                                for _, r_row in df_abertos.iterrows():
+                                    v_tot = float(r_row.get('valor_total', 0.0) or 0.0)
+                                    v_res = float(r_row.get('restante', 0.0) or 0.0)
+                                    total_falta_pagar += v_res if v_res > 0 else v_tot
+                        
+                                total_ja_pago = df_fin_cliente['valor_recebido'].sum() if 'valor_recebido' in df_fin_cliente.columns else 0.0
+                        
+                                col_m1, col_m2 = st.columns(2)
+                                with col_m1:
+                                    st.metric("🔴 Saldo Devedor (Falta Pagar)", f"R$ {total_falta_pagar:.2f}")
+                                with col_m2:
+                                    st.metric("🟢 Total Já Pago pelo Cliente", f"R$ {total_ja_pago:.2f}")
+                        
+                                # -----------------------------------------------------------------------------
+                                # CLASSE PARA GERAR O PDF COM O CABEÇALHO, RESUMO E VALOR UNITÁRIO
+                                # -----------------------------------------------------------------------------
+                                class PDFComprovante(FPDF):
+                                    def __init__(self, cliente_nome, saldo_devedor, total_pago):
+                                        super().__init__()
+                                        self.cliente_nome = cliente_nome
+                                        self.saldo_devedor = saldo_devedor
+                                        self.total_pago = total_pago
+                        
+                                    def header(self):
+                                        self.set_font('Arial', 'B', 14)
+                                        self.set_text_color(20, 70, 140)
+                                        self.cell(0, 6, "REY DA CEBOLA", 0, 1, 'C')
+                                        
+                                        self.set_font('Arial', '', 9)
+                                        self.set_text_color(50, 50, 50)
+                                        self.cell(0, 4, "CNPJ: 194.174.39/0001-42   INSC.EST.: 12.426725-4", 0, 1, 'C')
+                                        self.cell(0, 4, "CONTATO: (99) 98814-9722 OU (99) 98414-3943", 0, 1, 'C')
+                                        
+                                        self.set_font('Arial', 'B', 11)
+                                        self.cell(0, 6, "Extrato Financeiro / Comprovante do Cliente", 0, 1, 'C')
+                                        
+                                        self.set_font('Arial', 'B', 10)
+                                        data_atual_str = datetime.now(ZoneInfo("America/Sao_Paulo")).strftime('%Y-%m-%d %H:%M:%S')
+                                        self.cell(0, 6, f"Cliente: {self.cliente_nome} | Gerado em: {data_atual_str}", 0, 1, 'L')
+                                        
+                                        # Quadro de Resumo Financeiro no Topo do PDF
+                                        self.ln(2)
+                                        self.set_fill_color(240, 240, 240)
+                                        self.set_font('Arial', 'B', 9)
+                                        self.cell(95, 6, f"Saldo Devedor (Falta Pagar): R$ {self.saldo_devedor:.2f}", 1, 0, 'L', True)
+                                        self.cell(95, 6, f"Total Ja Pago: R$ {self.total_pago:.2f}", 1, 1, 'L', True)
+                                        
+                                        self.ln(2)
+                                        self.set_draw_color(20, 70, 140)
+                                        self.line(10, self.get_y(), 200, self.get_y())
+                                        self.ln(4)
+                        
+                                    def footer(self):
+                                        self.set_y(-15)
+                                        self.set_font('Arial', 'I', 8)
+                                        self.cell(0, 10, f"Pagina {self.page_no()}", 0, 0, 'C')
+                        
+                                def gerar_pdf_bytes(nome_cli, df_completo, s_dev, t_pag):
+                                    pdf = PDFComprovante(nome_cli, s_dev, t_pag)
+                                    pdf.add_page()
+                                    pdf.set_font('Arial', '', 10)
+                                    
+                                    pdf.set_font('Arial', 'B', 10)
+                                    pdf.cell(0, 6, "Historico de Transacoes:", 0, 1, 'L')
+                                    pdf.ln(2)
+                                    
+                                    # Cabeçalho da Tabela no PDF
+                                    pdf.set_fill_color(230, 230, 230)
+                                    pdf.cell(10, 6, "ID", 1, 0, 'C', True)
+                                    pdf.cell(58, 6, "Produto", 1, 0, 'L', True)
+                                    pdf.cell(15, 6, "Qtd", 1, 0, 'C', True)
+                                    pdf.cell(24, 6, "Vlr. Unit.", 1, 0, 'R', True)
+                                    pdf.cell(24, 6, "Total (R$)", 1, 0, 'R', True)
+                                    pdf.cell(32, 6, "Status", 1, 0, 'C', True)
+                                    pdf.cell(27, 6, "Data", 1, 1, 'C', True)
+                                    
+                                    pdf.set_font('Arial', '', 9)
+                                    for _, row in df_completo.iterrows():
+                                        pdf.cell(10, 6, str(row.get('id', '')), 1, 0, 'C')
+                                        pdf.cell(58, 6, str(row.get('produto', ''))[:26], 1, 0, 'L')
+                                        
+                                        qtd = float(row.get('quantidade', 0) or 0)
+                                        pdf.cell(15, 6, str(int(qtd) if qtd.is_integer() else qtd), 1, 0, 'C')
+                                        
+                                        val_tot = float(row.get('valor_total', 0.0) or 0.0)
+                                        val_unit = (val_tot / qtd) if qtd > 0 else float(row.get('valor_venda', 0.0) or 0.0)
+                                        
+                                        pdf.cell(24, 6, f"R$ {val_unit:.2f}", 1, 0, 'R')
+                                        pdf.cell(24, 6, f"R$ {val_tot:.2f}", 1, 0, 'R')
+                                        
+                                        st_val = str(row.get('status', ''))
+                                        if st_val.lower() in ['nan', 'none', '']:
+                                            status_exibicao = "Pendente" if row.get('is_aberto', True) else "Quitado"
+                                        else:
+                                            status_exibicao = st_val.capitalize()
+                        
+                                        pdf.cell(32, 6, status_exibicao[:15], 1, 0, 'C')
+                                        data_val = str(row.get('data', ''))[:16]
+                                        pdf.cell(27, 6, data_val, 1, 1, 'C')
+                                        
+                                    # Tratamento robusto para extrair os bytes do PDF sem corromper
+                                    try:
+                                        res = pdf.output(dest='S')
+                                        if isinstance(res, str):
+                                            return res.encode('latin1', errors='replace')
+                                        elif isinstance(res, (bytes, bytearray)):
+                                            return bytes(res)
+                                    except Exception:
+                                        pass
+                                    
+                                    try:
+                                        res2 = pdf.output()
+                                        if isinstance(res2, bytes):
+                                            return res2
+                                        elif isinstance(res2, bytearray):
+                                            return bytes(res2)
+                                        elif isinstance(res2, str):
+                                            return res2.encode('latin1', errors='replace')
+                                    except Exception:
+                                        pass
+                                        
+                                    return b""
+                        
+                                st.markdown("---")
+                                pdf_data = gerar_pdf_bytes(nome_atual, df_fin_cliente, total_falta_pagar, total_ja_pago)
+                                
+                                if pdf_data:
+                                    st.download_button(
+                                        label="📥 Descarregar Comprovante / Extrato em PDF",
+                                        data=pdf_data,
+                                        file_name=f"comprovante_{nome_atual.replace(' ', '_')}.pdf",
+                                        mime="application/pdf",
+                                        type="secondary"
+                                    )
+                                else:
+                                    st.error("Erro ao gerar o ficheiro PDF.")
+                        
+                                st.markdown("---")
+                        
+                                aba_aberto, aba_pago = st.tabs(["🔴 Compras Pendentes (Em Aberto)", "🟢 Histórico de Pagamentos (Quitados)"])
+                        
+                                with aba_aberto:
+                                    if not df_abertos.empty:
+                                        st.info("💡 Marque as compras que o cliente deseja pagar. A data e a hora serão gravadas no horário do Brasil.")
+                                        
+                                        df_abertos_ex = df_abertos.copy()
+                                        df_abertos_ex.insert(0, "Quitar?", False)
+                        
+                                        colunas_desejadas = [c for c in ['Quitar?', 'id', 'produto', 'quantidade', 'valor_total', 'valor_recebido', 'restante', 'data'] if c in df_abertos_ex.columns]
+                                        
+                                        df_edit_abertos = st.data_editor(
+                                            df_abertos_ex[colunas_desejadas],
+                                            use_container_width=True,
+                                            hide_index=True,
+                                            key="editor_vendas_abertas_cliente"
+                                        )
+                        
+                                        st.markdown("---")
+                                        col_b1, col_b2 = st.columns(2)
+                                        with col_b1:
+                                            forma_recebimento = st.selectbox(
+                                                "💳 Forma de Recebimento:",
+                                                ["Dinheiro", "Pix", "Cartão de Crédito", "Cartão de Débito", "Transferência", "Outros"],
+                                                key="select_forma_recebimento_baixa"
+                                            )
+                                        with col_b2:
+                                            valor_recebido_input = st.number_input(
+                                                "💵 Valor que o Cliente está Pagando Agora (R$):",
+                                                min_value=0.0,
+                                                value=float(total_falta_pagar),
+                                                step=1.0,
+                                                key="input_valor_recebido_baixa"
+                                            )
+                        
+                                        if st.button("✅ Confirmar Recebimento", type="primary", key="btn_dar_baixa_vendas_direto"):
+                                            try:
+                                                cursor = conn.cursor()
+                                                marcados = df_edit_abertos[df_edit_abertos['Quitar?'] == True]
+                                                if not marcados.empty:
+                                                    dinheiro_disponivel = float(valor_recebido_input)
+                                                    data_agora = datetime.now(ZoneInfo("America/Sao_Paulo")).strftime('%Y-%m-%d %H:%M:%S')
+                                                    
+                                                    for _, row_m in marcados.iterrows():
+                                                        v_id = row_m['id']
+                                                        v_total = float(row_m.get('valor_total', 0.0) or 0.0)
+                                                        v_restante_atual = float(row_m.get('restante', 0.0) or 0.0)
+                                                        debito_alvo = v_restante_atual if v_restante_atual > 0 else v_total
+                                                        
+                                                        ja_pago_anterior = float(row_m.get('valor_recebido', 0.0) or 0.0)
+                        
+                                                        if dinheiro_disponivel >= debito_alvo:
+                                                            novo_valor_recebido = ja_pago_anterior + debito_alvo
+                                                            cursor.execute(
+                                                                """UPDATE vendas 
+                                                                   SET status = 'Quitado', 
+                                                                       forma_pagamento = ?, 
+                                                                       valor_recebido = ?, 
+                                                                       troco = 0.0, 
+                                                                       restante = 0.0,
+                                                                       data = ?
+                                                                   WHERE id = ?""",
+                                                                (f"Quitado ({forma_recebimento})", novo_valor_recebido, data_agora, v_id)
+                                                            )
+                                                            dinheiro_disponivel -= debito_alvo
+                                                        elif dinheiro_disponivel > 0:
+                                                            v_pago_agora = dinheiro_disponivel
+                                                            novo_valor_recebido = ja_pago_anterior + v_pago_agora
+                                                            v_novo_restante = debito_alvo - v_pago_agora
+                                                            cursor.execute(
+                                                                """UPDATE vendas 
+                                                                   SET status = 'Parcial', 
+                                                                       forma_pagamento = ?, 
+                                                                       valor_recebido = ?, 
+                                                                       troco = 0.0, 
+                                                                       restante = ?,
+                                                                       data = ?
+                                                                   WHERE id = ?""",
+                                                                (f"Parcial ({forma_recebimento})", novo_valor_recebido, v_novo_restante, data_agora, v_id)
+                                                            )
+                                                            dinheiro_disponivel = 0.0
+                                                        else:
+                                                            break
+                                                    
+                                                    conn.commit()
+                                                    st.success("🎉 Pagamento registado no horário do Brasil com sucesso!")
+                                                    st.rerun()
+                                                else:
+                                                    st.warning("⚠️ Marque pelo menos uma compra na coluna 'Quitar?' para registar o pagamento.")
+                                            except Exception as e_quitar:
+                                                st.error(f"Erro ao processar recebimento: {e_quitar}")
+                                    else:
+                                        st.success("✨ Este cliente não possui nenhuma compra em aberto no momento!")
+                        
+                                with aba_pago:
+                                    if not df_quitados.empty:
+                                        cols_drop = [c for c in ['status_limpo', 'is_aberto'] if c in df_quitados.columns]
+                                        st.dataframe(df_quitados.drop(columns=cols_drop), use_container_width=True, hide_index=True)
+                                    else:
+                                        st.info("Nenhum histórico de pagamento quitado encontrado para este cliente.")
+                        
+                            else:
+                                st.info(f"ℹ️ Não há registos de vendas ou pedidos associados ao cliente '{nome_atual}'.")
+                        
+                        except Exception as e_fin:
+                            st.warning(f"Extrato financeiro indisponível no momento: {e_fin}")
+                    else:
+                        st.info("Nenhum cliente cadastrado ainda.")
+                else:
+                    st.info("Nenhum cliente cadastrado ainda.")
+    
+            with tab_prod:
+                st.subheader("📝 Gerenciar Produtos (Cadastrar, Editar e Excluir)")
+                try:
+                    df_g = carregar_dados("SELECT DISTINCT grupo FROM grupos WHERE grupo IS NOT NULL AND grupo != '' ORDER BY grupo")
+                    grupos_opt = df_g['grupo'].tolist() if not df_g.empty else ["GERAL"]
+                except Exception:
+                    grupos_opt = ["GERAL"]
+    
+                try:
+                    df_f = carregar_dados("SELECT DISTINCT fornecedor FROM fornecedores WHERE fornecedor IS NOT NULL AND fornecedor != '' ORDER BY fornecedor")
+                    fornecedores_opt = df_f['fornecedor'].tolist() if not df_f.empty else ["BAHIA"]
+                except Exception:
+                    fornecedores_opt = ["BAHIA"]
+    
+                with st.form("form_cadastrar_produto", clear_on_submit=True):
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        txt_nome_produto = st.text_input("Nome do Produto")
+                        val_compra = st.number_input("Preço de Compra (R$)", min_value=0.0, value=0.0, step=0.5)
+                        estoque_inicial = st.number_input("Estoque Inicial", min_value=0.0, value=0.0, step=1.0)
+                    with col2:
+                        grupo_produto = st.selectbox("Grupo / Categoria", grupos_opt)
+                        val_venda = st.number_input("Preço de Venda (R$)", min_value=0.0, value=0.0, step=0.5)
+                        fornecedor_produto = st.selectbox("Fornecedor", fornecedores_opt)
+    
+                    btn_salvar = st.form_submit_button("💾 Salvar Novo Produto")
+                    if btn_salvar:
+                        if not txt_nome_produto.strip():
+                            st.warning("Por favor, informe o nome do produto.")
+                        else:
+                            try:
+                                cursor = conn.cursor()
+                                for col in ["grupo", "fornecedor", "valor_compra", "valor_venda"]:
+                                    try:
+                                        cursor.execute(f"ALTER TABLE produtos ADD COLUMN {col} TEXT")
+                                    except Exception:
+                                        pass
+    
+                                cursor.execute("INSERT INTO produtos (produto, grupo, fornecedor, quantidade, valor_compra, valor_venda) VALUES (?, ?, ?, ?, ?, ?)", (txt_nome_produto.strip().upper(), grupo_produto, fornecedor_produto, float(estoque_inicial), float(val_compra), float(val_venda)))
+                                conn.commit()
+                                st.cache_data.clear()
+                                st.success(f"✅ Produto '{txt_nome_produto}' cadastrado com sucesso!")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Erro ao cadastrar produto: {e}")
+    
+                st.markdown("---")
+                st.subheader("📋 Lista de Produtos")
+                try:
+                    df_produtos_gerenciar = pd.read_sql_query("SELECT * FROM produtos", conn)
+                except Exception:
+                    df_produtos_gerenciar = pd.DataFrame()
+    
+                cols_esperadas = ['id', 'produto', 'quantidade', 'valor_compra', 'valor_venda', 'grupo', 'fornecedor']
+                for c in cols_esperadas:
+                    if c not in df_produtos_gerenciar.columns:
+                        df_produtos_gerenciar[c] = 0.0 if ('valor' in c or 'quantidade' in c) else ""
+    
+                if not df_produtos_gerenciar.empty:
+                    cols_finais = [c for c in cols_esperadas if c in df_produtos_gerenciar.columns]
+                    df_produtos_gerenciar = df_produtos_gerenciar[cols_finais]
+    
+                df_gerenciar_editado = st.data_editor(df_produtos_gerenciar, use_container_width=True, hide_index=True, key="editor_gerenciar_produtos_tab")
+    
+                col_btn_salvar, col_btn_excluir = st.columns([1, 1])
+                with col_btn_salvar:
+                    if st.button("💾 Salvar Alterações da Tabela", type="primary", key="btn_salvar_tabela_gerenciar"):
+                        try:
+                            with conn:
+                                cursor = conn.cursor()
+                                for _, row in df_gerenciar_editado.iterrows():
+                                    cursor.execute("UPDATE produtos SET produto = ?, quantidade = ?, valor_compra = ?, valor_venda = ?, grupo = ?, fornecedor = ? WHERE id = ?", (row['produto'], row['quantidade'], row['valor_compra'], row['valor_venda'], row['grupo'], row['fornecedor'], row['id']))
+                            st.cache_data.clear()
+                            st.success("✅ Alterações salvas com sucesso!")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Erro ao salvar alterações: {e}")
+    
+                with col_btn_excluir:
+                    lista_produtos_excluir = df_produtos_gerenciar['produto'].tolist() if not df_produtos_gerenciar.empty else []
+                    prod_para_excluir = st.selectbox("Selecione um produto para excluir", options=lista_produtos_excluir, key="sel_prod_excluir")
+                    if st.button("🗑️ Excluir Produto Selecionado", key="btn_excluir_produto"):
+                        if prod_para_excluir:
+                            try:
+                                with conn:
+                                    cursor = conn.cursor()
+                                    cursor.execute("DELETE FROM produtos WHERE produto = ?", (prod_para_excluir,))
+                                st.cache_data.clear()
+                                st.success(f"✅ Produto '{prod_para_excluir}' excluído com sucesso!")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Erro ao excluir produto: {e}")
+                        else:
+                            st.warning("Nenhum produto selecionado para exclusão.")
+    
+            with tab_forn:
+                st.subheader("🏢 Gerenciar Fornecedores")
+                with st.form("form_cad_fornecedor", clear_on_submit=True):
+                    nome_forn = st.text_input("Nome do Fornecedor / Empresa")
+                    if st.form_submit_button("Salvar Novo Fornecedor"):
+                        if nome_forn.strip():
+                            try:
+                                salvar_simples("fornecedores", "fornecedor", nome_forn.upper())
+                                st.success(f"Fornecedor '{nome_forn}' cadastrado com sucesso!")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Erro ao cadastrar fornecedor: {e}")
+                        else:
+                            st.warning("Informe o nome do fornecedor.")
+    
+                st.markdown("---")
+                st.subheader("📋 Lista de Fornecedores")
+                df_forn_view = carregar_dados("SELECT * FROM fornecedores")
+                if not df_forn_view.empty:
+                    df_editado_forn = st.data_editor(df_forn_view, use_container_width=True, hide_index=True, key="editor_fornecedores")
+                    col_f1, col_f2 = st.columns(2)
+                    with col_f1:
+                        if st.button("💾 Salvar Alterações de Fornecedores"):
+                            try:
+                                cursor = conn.cursor()
+                                for _, row in df_editado_forn.iterrows():
+                                    cursor.execute("UPDATE fornecedores SET fornecedor = ? WHERE id = ?", (str(row.get('fornecedor')).upper(), row.get('id')))
+                                conn.commit()
+                                st.success("Fornecedores atualizados com sucesso!")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Erro ao salvar: {e}")
+                    with col_f2:
+                        forn_selecionado = st.selectbox("Selecione um fornecedor para excluir", df_forn_view['fornecedor'].tolist(), key="select_del_forn")
+                        if st.button("🗑️ Excluir Fornecedor Selecionado"):
+                            try:
+                                cursor = conn.cursor()
+                                cursor.execute("DELETE FROM fornecedores WHERE fornecedor = ?", (forn_selecionado,))
+                                conn.commit()
+                                st.success(f"Fornecedor '{forn_selecionado}' excluído com sucesso!")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Erro ao excluir: {e}")
+                else:
+                    st.info("Nenhum fornecedor cadastrado.")
+    
+            with tab_grup:
+                st.subheader("🏷️ Gerenciar Grupos / Categorias")
+                with st.form("form_cad_grupo", clear_on_submit=True):
+                    nome_grupo = st.text_input("Nome do Grupo / Categoria")
+                    if st.form_submit_button("Salvar Novo Grupo"):
+                        if nome_grupo.strip():
+                            try:
+                                salvar_simples("grupos", "grupo", nome_grupo.upper())
+                                st.success(f"Grupo '{nome_grupo}' cadastrado com sucesso!")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Erro ao cadastrar grupo: {e}")
+                        else:
+                            st.warning("Informe o nome do grupo.")
+    
+                st.markdown("---")
+                st.subheader("📋 Lista de Grupos")
+                df_grup_view = carregar_dados("SELECT * FROM grupos")
+                if not df_grup_view.empty:
+                    df_editado_grup = st.data_editor(df_grup_view, use_container_width=True, hide_index=True, key="editor_grupos")
+                    col_g1, col_g2 = st.columns(2)
+                    with col_g1:
+                        if st.button("💾 Salvar Alterações de Grupos"):
+                            try:
+                                cursor = conn.cursor()
+                                for _, row in df_editado_grup.iterrows():
+                                    cursor.execute("UPDATE grupos SET grupo = ? WHERE id = ?", (str(row.get('grupo')).upper(), row.get('id')))
+                                conn.commit()
+                                st.success("Grupos atualizados com sucesso!")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Erro ao salvar: {e}")
+                    with col_g2:
+                        grup_selecionado = st.selectbox("Selecione um grupo para excluir", df_grup_view['grupo'].tolist(), key="select_del_grup")
+                        if st.button("🗑️ Excluir Grupo Selecionado"):
+                            try:
+                                cursor = conn.cursor()
+                                cursor.execute("DELETE FROM grupos WHERE grupo = ?", (grup_selecionado,))
+                                conn.commit()
+                                st.success(f"Grupo '{grup_selecionado}' excluído com sucesso!")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Erro ao excluir: {e}")
+                else:
+                    st.info("Nenhum grupo cadastrado.")
+                                
+        elif menu_admin == "💾 Backup e Restauração":
+            st.title("💾 Central de Backup e Restauração")
+            st.info("Gerencie cópias de segurança do seu banco de dados com total segurança.")
+
+            tab_bk1, tab_bk2 = st.tabs(["📤 Fazer Backup", "📥 Restaurar Backup"])
+
+            with tab_bk1:
+                st.subheader("Gerar Cópia de Segurança")
+                st.write("Clique no botão abaixo para baixar o arquivo contendo todos os seus produtos, clientes e vendas atualizados.")
+                try:
+                    with open("crm_comercio.db", "rb") as f:
+                        bytes_db = f.read()
+                    data_hoje = datetime.now().strftime("%Y-%m-%d_%H-%M")
+                    st.download_button(
+                        label="📥 Baixar Arquivo de Backup (.db)",
+                        data=bytes_db,
+                        file_name=f"backup_crm_comercio_{data_hoje}.db",
+                        mime="application/octet-stream",
+                        type="primary"
+                    )
+                except Exception:
+                    st.warning("O arquivo do banco de dados ainda não foi criado ou não foi encontrado.")
+
+            with tab_bk2:
+                st.subheader("Restaurar Sistema por Arquivo de Backup")
+                st.warning("⚠️ **Atenção:** Enviar um arquivo de backup antigo irá substituir os dados atuais.")
+                arquivo_upload = st.file_uploader("Selecione o arquivo de backup (.db)", type=["db"])
+                if arquivo_upload is not None:
+                    if st.button("🔄 Confirmar e Restaurar Banco de Dados", type="primary"):
+                        try:
+                            with open("crm_comercio.db", "wb") as f:
+                                f.write(arquivo_upload.getbuffer())
+                            st.success("✅ Backup restaurado com sucesso! Recarregando o sistema...")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Erro ao restaurar o backup: {e}")            
+
+        elif "RH" in str(menu_admin) or "Recursos Humanos" in str(menu_admin):
+            st.title("👥 Gestão de Recursos Humanos (RH)")
+            st.markdown("Faça a gestão de colaboradores, registos com descontos, vales, haveres e emissão de Holerites em PDF.")
+        
+            from datetime import datetime
+        
+            # Função ultra-segura para gerar o PDF do Holerite com Ambas as Datas e Detalhes
+            def gerar_bytes_pdf(dados_func, dados_pag):
+                try:
+                    from fpdf import FPDF
+                    pdf = FPDF(orientation='P', unit='mm', format='A4')
+                    pdf.add_page()
+                    
+                    # Desenha o Recibo
+                    pdf.rect(10, 10, 190, 134)
+                    pdf.rect(10, 10, 130, 22)
+                    pdf.rect(140, 10, 60, 22)
+                    
+                    pdf.set_xy(12, 11)
+                    pdf.set_font("Arial", "B", 7)
+                    pdf.cell(126, 4, "EMPREGADOR:", 0, 1)
+                    pdf.set_font("Arial", "", 7)
+                    pdf.set_x(12)
+                    pdf.cell(126, 3.5, "Nome: NM COMERCIO", 0, 1)
+                    pdf.set_x(12)
+                    pdf.cell(126, 3.5, "Endereço: Rua Principal, S/N - BA", 0, 1)
+                    pdf.set_x(12)
+                    pdf.cell(126, 3.5, "CNPJ: 194.174.39/0001-42", 0, 1)
+                    
+                    pdf.set_xy(142, 11)
+                    pdf.set_font("Arial", "B", 8.5)
+                    pdf.cell(56, 4, "Recibo de Pagamento", 0, 1, 'C')
+                    pdf.set_xy(142, 15)
+                    pdf.set_font("Arial", "B", 7.5)
+                    pdf.cell(56, 3.5, "de Salário / Vales", 0, 1, 'C')
+                    
+                    # 1. Competência / Referência
+                    pdf.set_xy(142, 19)
+                    pdf.set_font("Arial", "", 7)
+                    ref_raw = str(dados_pag.get('referencia', datetime.now().strftime('%Y-%m')))
+                    if len(ref_raw) >= 7 and '-' in ref_raw:
+                        p_ano, p_mes = ref_raw.split('-')[:2]
+                        ref_mes = f"01/{p_mes}/{p_ano}"
+                    else:
+                        ref_mes = ref_raw
+                    pdf.cell(56, 3, f"Ref: {ref_mes}", 0, 1, 'C')
+
+                    # 2. Data do Pagamento Efetuado
+                    pdf.set_xy(142, 22.5)
+                    data_pag_raw = str(dados_pag.get('data_pagamento', ''))
+                    if len(data_pag_raw) >= 10:
+                        dp_parts = data_pag_raw[:10].split('-')
+                        if len(dp_parts) == 3:
+                            data_pag_fmt = f"{dp_parts[2]}/{dp_parts[1]}/{dp_parts[0]}"
+                        else:
+                            data_pag_fmt = data_pag_raw[:10]
+                    else:
+                        data_pag_fmt = data_pag_raw[:10] if data_pag_raw else '-'
+                    pdf.cell(56, 3, f"Data Pgto: {data_pag_fmt}", 0, 1, 'C')
+        
+                    pdf.rect(10, 32, 190, 12)
+                    pdf.set_xy(12, 33)
+                    pdf.set_font("Arial", "B", 7)
+                    pdf.cell(20, 3, "CÓDIGO", 0, 0)
+                    pdf.cell(85, 3, "NOME DO FUNCIONÁRIO", 0, 0)
+                    pdf.cell(35, 3, "CBO", 0, 0)
+                    pdf.cell(50, 3, "FUNÇÃO", 0, 0)
+                    
+                    pdf.set_xy(12, 37)
+                    pdf.set_font("Arial", "", 8)
+                    func_id = int(dados_func.get('id', 1))
+                    pdf.cell(20, 5, f"{func_id:05d}", 0, 0)
+                    pdf.cell(85, 5, str(dados_func.get('nome', '')), 0, 0)
+                    pdf.cell(35, 5, str(dados_func.get('cbo', '-')), 0, 0)
+                    pdf.cell(50, 5, str(dados_func.get('cargo', '-')), 0, 0)
+        
+                    pdf.rect(10, 44, 190, 7)
+                    pdf.set_xy(12, 45)
+                    pdf.set_font("Arial", "B", 7)
+                    pdf.cell(15, 5, "Cód.", 0, 0)
+                    pdf.cell(75, 5, "Descrição", 0, 0)
+                    pdf.cell(25, 5, "Referência", 0, 0, 'C')
+                    pdf.cell(37, 5, "Proventos", 0, 0, 'R')
+                    pdf.cell(38, 5, "Descontos", 0, 1, 'R')
+        
+                    pdf.rect(10, 51, 190, 58)
+                    pdf.set_xy(12, 53)
+                    pdf.set_font("Arial", "", 8)
+                    
+                    valor_salario = float(dados_pag.get('valor', 0.0))
+                    tipo_pag = str(dados_pag.get('tipo', 'Salário')).upper()
+                    inss_val = float(dados_pag.get('inss', 0.0))
+                    faltas_qtd = float(dados_pag.get('faltas', 0.0))
+                    desc_faltas = float(dados_pag.get('desconto_faltas', 0.0))
+        
+                    pdf.cell(15, 5, "001", 0, 0)
+                    pdf.cell(75, 5, f"{tipo_pag}", 0, 0)
+                    pdf.cell(25, 5, "220.00", 0, 0, 'C')
+                    pdf.cell(37, 5, f"R$ {valor_salario:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."), 0, 0, 'R')
+                    pdf.cell(38, 5, "R$ 0,00", 0, 1, 'R')
+        
+                    curr_y = 58
+                    if faltas_qtd > 0 or desc_faltas > 0:
+                        pdf.set_xy(12, curr_y)
+                        pdf.cell(15, 5, "450", 0, 0)
+                        pdf.cell(75, 5, f"FALTAS ({faltas_qtd} dia(s))", 0, 0)
+                        pdf.cell(25, 5, f"{faltas_qtd:.1f}", 0, 0, 'C')
+                        pdf.cell(37, 5, "R$ 0,00", 0, 0, 'R')
+                        pdf.cell(38, 5, f"R$ {desc_faltas:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."), 0, 1, 'R')
+                        curr_y += 5
+        
+                    if inss_val > 0:
+                        pdf.set_xy(12, curr_y)
+                        pdf.cell(15, 5, "903", 0, 0)
+                        pdf.cell(75, 5, "INSS", 0, 0)
+                        pdf.cell(25, 5, "", 0, 0, 'C')
+                        pdf.cell(37, 5, "R$ 0,00", 0, 0, 'R')
+                        pdf.cell(38, 5, f"R$ {inss_val:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."), 0, 1, 'R')
+        
+                    total_venc = valor_salario
+                    total_desc = inss_val + desc_faltas
+                    liquido = total_venc - total_desc
+        
+                    pdf.rect(10, 109, 130, 17)
+                    pdf.rect(140, 109, 60, 17)
+                    
+                    pdf.set_xy(12, 110)
+                    pdf.set_font("Arial", "B", 7)
+                    pdf.cell(126, 3, "MENSAGENS:", 0, 1)
+                    pdf.set_font("Arial", "", 7)
+                    pdf.set_x(12)
+                    pdf.cell(126, 3, "Documento gerado automaticamente pelo Sistema CRM Comércio.", 0, 1)
+        
+                    pdf.set_xy(142, 110)
+                    pdf.set_font("Arial", "B", 7)
+                    pdf.cell(28, 4, "Total Vencimentos:", 0, 0)
+                    pdf.cell(28, 4, f"R$ {total_venc:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."), 0, 1, 'R')
+                    
+                    pdf.set_x(142)
+                    pdf.cell(28, 4, "Total Descontos:", 0, 0)
+                    pdf.cell(28, 4, f"R$ {total_desc:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."), 0, 1, 'R')
+                    
+                    pdf.set_x(142)
+                    pdf.set_font("Arial", "B", 8)
+                    pdf.cell(28, 5, "Líquido a Receber:", 0, 0)
+                    pdf.cell(28, 5, f"R$ {liquido:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."), 0, 1, 'R')
+        
+                    pdf.rect(10, 126, 190, 18)
+                    pdf.set_xy(12, 127)
+                    pdf.set_font("Arial", "B", 6)
+                    pdf.cell(31, 3, "Salário Base", 0, 0)
+                    pdf.cell(31, 3, "Base Cálc. INSS", 0, 0)
+                    pdf.cell(31, 3, "Base Cálc. FGTS", 0, 0)
+                    pdf.cell(31, 3, "FGTS do Mês", 0, 0)
+                    pdf.cell(32, 3, "Base Cálc. IRRF", 0, 0)
+                    pdf.cell(32, 3, "Faixa IRRF", 0, 1)
+        
+                    pdf.set_xy(12, 132)
+                    pdf.set_font("Arial", "", 7)
+                    pdf.cell(31, 4, f"R$ {valor_salario:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."), 0, 0)
+                    base_inss = max(0.0, valor_salario - desc_faltas)
+                    pdf.cell(31, 4, f"R$ {base_inss:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."), 0, 0)
+                    pdf.cell(31, 4, f"R$ {valor_salario:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."), 0, 0)
+                    fgts_val = valor_salario * 0.08
+                    pdf.cell(31, 4, f"R$ {fgts_val:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."), 0, 0)
+                    pdf.cell(32, 4, "R$ 0,00", 0, 0)
+                    pdf.cell(32, 4, "0", 0, 1)
+        
+                    res = pdf.output(dest='S')
+                    if isinstance(res, str):
+                        return res.encode('latin1', errors='replace')
+                    return bytes(res)
+                except Exception as e:
+                    return f"Erro PDF: {str(e)}".encode('utf-8')
+        
+            # Garantir tabelas com coluna competencia
+            try:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS funcionarios (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        nome TEXT,
+                        cargo TEXT,
+                        telefone TEXT,
+                        salario REAL,
+                        admissao TEXT,
+                        cbo TEXT
+                    )
+                """)
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS pagamentos_funcionarios (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        colaborador TEXT,
+                        tipo TEXT,
+                        valor REAL,
+                        data_pagamento TEXT,
+                        inss REAL DEFAULT 0.0,
+                        faltas REAL DEFAULT 0.0,
+                        desconto_faltas REAL DEFAULT 0.0,
+                        competencia TEXT DEFAULT ''
+                    )
+                """)
+                for col_def in [("inss", "REAL DEFAULT 0.0"), ("faltas", "REAL DEFAULT 0.0"), ("desconto_faltas", "REAL DEFAULT 0.0"), ("competencia", "TEXT DEFAULT ''")]:
+                    try:
+                        cursor.execute(f"ALTER TABLE pagamentos_funcionarios ADD COLUMN {col_def[0]} {col_def[1]}")
+                    except Exception:
+                        pass
+                conn.commit()
+            except Exception:
+                pass
+        
+            aba_colab, aba_pagamentos, aba_pendentes = st.tabs([
+                "👥 Colaboradores", 
+                "💸 Registar Pagamentos / Vales", 
+                "📅 Salários Pendentes e a Vencer"
+            ])
+        
+            with aba_colab:
+                with st.expander("➕ Adicionar Novo Colaborador"):
+                    with st.form("form_novo_funcionario", clear_on_submit=True):
+                        col_f1, col_f2 = st.columns(2)
+                        with col_f1:
+                            novo_nome = st.text_input("Nome Completo do Colaborador")
+                            novo_cargo = st.text_input("Cargo / Função")
+                            novo_cbo = st.text_input("CBO (Ex: 5211-10)", value="5211-10")
+                        with col_f2:
+                            novo_tel = st.text_input("Telefone / Telemóvel")
+                            novo_salario = st.number_input("Salário Base (R$)", min_value=0.0, value=1412.0, step=50.0)
+                            nova_admissao = st.date_input("Data de Admissão")
+        
+                        btn_salvar_func = st.form_submit_button("💾 Guardar Colaborador", use_container_width=True)
+                        if btn_salvar_func:
+                            if novo_nome.strip():
+                                try:
+                                    cursor = conn.cursor()
+                                    cursor.execute("""
+                                        INSERT INTO funcionarios (nome, cargo, telefone, salario, admissao, cbo)
+                                        VALUES (?, ?, ?, ?, ?, ?)
+                                    """, (novo_nome, novo_cargo, novo_tel, novo_salario, str(nova_admissao), novo_cbo))
+                                    conn.commit()
+                                    st.success("✅ Colaborador registado com sucesso!")
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"Erro: {e}")
+                            else:
+                                st.warning("⚠️ O nome do colaborador é obrigatório.")
+        
+                st.markdown("---")
+        
+                try:
+                    df_func = pd.read_sql_query("SELECT * FROM funcionarios", conn)
+                except Exception:
+                    df_func = pd.DataFrame()
+        
+                if not df_func.empty:
+                    total_colaboradores = len(df_func)
+                    folha_salarial = pd.to_numeric(df_func['salario'], errors='coerce').sum()
+        
+                    col_m1, col_m2 = st.columns(2)
+                    with col_m1:
+                        st.metric("👨‍💼 Total de Colaboradores", str(total_colaboradores))
+                    with col_m2:
+                        st.metric("💵 Folha Salarial Total Base", f"R$ {folha_salarial:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
+        
+                    st.markdown("---")
+                    st.subheader("📋 Lista de Colaboradores (Editável)")
+        
+                    df_func['salario'] = pd.to_numeric(df_func['salario'], errors='coerce').fillna(0.0)
+                    edited_func = st.data_editor(
+                        df_func,
+                        key="editor_tabela_funcionarios",
+                        use_container_width=True,
+                        num_rows="dynamic"
+                    )
+        
+                    if st.button("💾 Atualizar Alterações no RH", key="btn_salvar_rh", use_container_width=True):
+                        try:
+                            cursor = conn.cursor()
+                            for _, row in edited_func.iterrows():
+                                cursor.execute("""
+                                    UPDATE funcionarios 
+                                    SET nome = ?, cargo = ?, telefone = ?, salario = ?, admissao = ?, cbo = ?
+                                    WHERE id = ?
+                                """, (
+                                    str(row.get('nome', '')),
+                                    str(row.get('cargo', '')),
+                                    str(row.get('telefone', '')),
+                                    float(row.get('salario', 0)),
+                                    str(row.get('admissao', '')),
+                                    str(row.get('cbo', '-')),
+                                    int(row.get('id', 0))
+                                ))
+                            conn.commit()
+                            st.success("✅ Dados atualizados com sucesso!")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Erro: {e}")
+                else:
+                    st.info("ℹ️ Ainda não existem colaboradores registados.")
+        
+                # --- EXPANSOR PARA ELIMINAR COLABORADOR ---
+                with st.expander("🗑️ Eliminar Colaborador"):
+                    try:
+                        df_colab_del = pd.read_sql_query("SELECT nome FROM funcionarios", conn)
+                    except Exception:
+                        df_colab_del = pd.DataFrame()
+                
+                    if not df_colab_del.empty:
+                        colaboradores_lista = df_colab_del['nome'].tolist()
+                        colab_para_excluir = st.selectbox("Selecione o colaborador que deseja eliminar:", colaboradores_lista, key="select_colab_excluir_rh")
+                        
+                        if st.button("❌ Confirmar Eliminação", type="primary", key="btn_confirma_excluir_colab"):
+                            try:
+                                cursor = conn.cursor()
+                                with conn:
+                                    cursor.execute("DELETE FROM funcionarios WHERE nome = ?", (colab_para_excluir,))
+                                    cursor.execute("DELETE FROM pagamentos_funcionarios WHERE colaborador = ?", (colab_para_excluir,))
+                                
+                                st.cache_data.clear()
+                                st.success(f"✅ Colaborador '{colab_para_excluir}' e respetivos registos eliminados com sucesso!")
+                                st.rerun()
+                            except Exception as e_del:
+                                st.error(f"Erro ao eliminar colaborador: {e_del}")
+                    else:
+                        st.info("ℹ️ Não existem colaboradores registados para eliminar.")
+
+            with aba_pagamentos:
+                st.subheader("💸 Registar Pagamento, Salário, Vale ou Haver")
+                
+                try:
+                    df_func_list = pd.read_sql_query("SELECT id, nome, cargo, cbo, salario, admissao FROM funcionarios", conn)
+                    lista_nomes = df_func_list['nome'].tolist() if not df_func_list.empty else []
+                except Exception:
+                    df_func_list = pd.DataFrame()
+                    lista_nomes = []
+        
+                if lista_nomes:
+                    col_sel1, col_sel2 = st.columns(2)
+                    with col_sel1:
+                        colaborador_selecionado = st.selectbox("Selecione o Colaborador", lista_nomes, key="sel_colab_pag_v2")
+                    
+                    # Gerar lista de competências baseada na admissão
+                    func_row = df_func_list[df_func_list['nome'] == colaborador_selecionado]
+                    salario_base_func = float(func_row.iloc[0]['salario']) if not func_row.empty else 0.0
+                    admissao_func = str(func_row.iloc[0]['admissao']) if not func_row.empty else '2021-01-01'
+                    
+                    try:
+                        dt_adm = datetime.strptime(admissao_func[:10], '%Y-%m-%d').date()
+                    except Exception:
+                        dt_adm = datetime(2021, 1, 1).date()
+                    
+                    hoje = datetime.now().date()
+                    cur_y, cur_m = dt_adm.year, dt_adm.month
+                    cur_m += 1
+                    if cur_m > 12:
+                        cur_m = 1
+                        cur_y += 1
+                    
+                    lista_competencias = []
+                    lim_y = hoje.year + 1
+                    lim_m = 12
+                    while (cur_y < lim_y) or (cur_y == lim_y and cur_m <= lim_m):
+                        lista_competencias.append(f"01/{cur_m:02d}/{cur_y}")
+                        cur_m += 1
+                        if cur_m > 12:
+                            cur_m = 1
+                            cur_y += 1
+                    
+                    with col_sel2:
+                        competencia_selecionada = st.selectbox("Selecione a Competência / Mês", lista_competencias, key="sel_comp_pag_v2")
+                    
+                    # Calcular saldo restante para a competência selecionada
+                    try:
+                        df_todos_pag = pd.read_sql_query("SELECT * FROM pagamentos_funcionarios WHERE colaborador = ?", conn, params=(colaborador_selecionado,))
+                    except Exception:
+                        df_todos_pag = pd.DataFrame()
+                    
+                    parts_c = competencia_selecionada.split('/')
+                    mes_sel, ano_sel = parts_c[1], parts_c[2]
+                    
+                    vales_ja_dados = 0.0
+                    if not df_todos_pag.empty:
+                        for _, p_row in df_todos_pag.iterrows():
+                            comp_db = str(p_row.get('competencia', ''))
+                            data_db = str(p_row.get('data_pagamento', ''))
+                            if competencia_selecionada in comp_db or f"{ano_sel}-{mes_sel}" in data_db:
+                                vales_ja_dados += float(p_row.get('valor', 0.0))
+                    
+                    restante_calcular = max(0.0, salario_base_func - vales_ja_dados)
+                    
+                    st.info(f"📊 **Resumo da Competência {competencia_selecionada}:** Salário Base: **R$ {salario_base_func:,.2f}** | Já Lançado/Descontado: **R$ {vales_ja_dados:,.2f}** | **Restante a Pagar: R$ {restante_calcular:,.2f}**")
+
+                    with st.form("form_registo_pagamento", clear_on_submit=True):
+                        col_p1, col_p2 = st.columns(2)
+                        with col_p1:
+                            tipo_lancamento = st.selectbox("Descrição / Tipo", ["Salário Parcial", "Vale", "Haver", "Adiantamento", "Bónus", "Salário Final (Baixa Total)"])
+                            valor_lancamento = st.number_input("Valor da Transação (R$)", min_value=0.0, value=restante_calcular, step=50.0)
+                        with col_p2:
+                            inss_lancamento = st.number_input("Desconto INSS (R$)", min_value=0.0, value=0.0, step=10.0)
+                            faltas_qtd = st.number_input("Quantidade de Faltas (Dias)", min_value=0.0, value=0.0, step=1.0)
+                            desc_faltas_val = st.number_input("Desconto por Faltas (R$)", min_value=0.0, value=0.0, step=10.0)
+                            data_lancamento = st.date_input("Data do Recebimento")
+        
+                        btn_gravar_pagamento = st.form_submit_button("💾 Registar Lançamento, Descontar e Liberar Holerite", use_container_width=True)
+                        if btn_gravar_pagamento:
+                            if valor_lancamento > 0:
+                                try:
+                                    cursor = conn.cursor()
+                                    cursor.execute("""
+                                        INSERT INTO pagamentos_funcionarios (colaborador, tipo, valor, data_pagamento, inss, faltas, desconto_faltas, competencia)
+                                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                                    """, (colaborador_selecionado, tipo_lancamento, valor_lancamento, str(data_lancamento), inss_lancamento, faltas_qtd, desc_faltas_val, competencia_selecionada))
+                                    conn.commit()
+                                    st.success("✅ Transação registada com sucesso! O saldo foi descontado.")
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"Erro: {e}")
+                            else:
+                                st.warning("⚠️ Insira um valor superior a zero.")
+                else:
+                    st.warning("⚠️ Registe primeiro um colaborador na aba 'Colaboradores'.")
+        
+                st.markdown("---")
+                st.subheader("📊 Histórico de Pagamentos e Edição de Holerites")
+        
+                try:
+                    df_historico_pag = pd.read_sql_query("SELECT * FROM pagamentos_funcionarios ORDER BY id DESC", conn)
+                except Exception:
+                    df_historico_pag = pd.DataFrame()
+        
+                if not df_historico_pag.empty:
+                    for i, row_pag in df_historico_pag.iterrows():
+                        p_id = row_pag['id']
+                        p_collab = row_pag['colaborador']
+                        p_tipo = row_pag['tipo']
+                        p_valor = float(row_pag['valor'] or 0)
+                        p_data = str(row_pag['data_pagamento'])[:10]
+                        p_inss = float(row_pag.get('inss', 0) or 0)
+                        p_faltas = float(row_pag.get('faltas', 0) or 0)
+                        p_desc_faltas = float(row_pag.get('desconto_faltas', 0) or 0)
+                        p_comp = str(row_pag.get('competencia', p_data))
+                        
+                        f_info = df_func_list[df_func_list['nome'] == p_collab]
+                        f_dict = f_info.iloc[0].to_dict() if not f_info.empty else {'id': 1, 'cargo': 'Funcionário', 'cbo': '-'}
+        
+                        with st.expander(f"📄 {p_collab} — {p_tipo}: R$ {p_valor:,.2f} ( Ref: {p_comp} ) em {p_data}"):
+                            with st.form(f"form_edite_holerite_{p_id}_{i}"):
+                                ce1, ce2, ce3 = st.columns(3)
+                                with ce1:
+                                    novo_val_pag = st.number_input("Valor Bruto (R$)", value=p_valor, step=10.0, key=f"val_{p_id}_{i}")
+                                with ce2:
+                                    novo_inss = st.number_input("INSS (R$)", value=p_inss, step=5.0, key=f"inss_{p_id}_{i}")
+                                with ce3:
+                                    nova_qtd_faltas = st.number_input("Qtd Faltas", value=p_faltas, step=1.0, key=f"faltas_{p_id}_{i}")
+                                
+                                ce4, ce5 = st.columns(2)
+                                with ce4:
+                                    novo_desc_faltas = st.number_input("Desc. Faltas (R$)", value=p_desc_faltas, step=10.0, key=f"desc_f_{p_id}_{i}")
+                                with ce5:
+                                    st.markdown("<br>", unsafe_allow_html=True)
+                                    btn_atualiza_reg = st.form_submit_button("💾 Atualizar Dados do Holerite", use_container_width=True)
+        
+                                if btn_atualiza_reg:
+                                    try:
+                                        cursor = conn.cursor()
+                                        cursor.execute("""
+                                            UPDATE pagamentos_funcionarios 
+                                            SET valor = ?, inss = ?, faltas = ?, desconto_faltas = ?
+                                            WHERE id = ?
+                                        """, (novo_val_pag, novo_inss, nova_qtd_faltas, novo_desc_faltas, p_id))
+                                        conn.commit()
+                                        st.success("✅ Holerite atualizado com sucesso!")
+                                        st.rerun()
+                                    except Exception as e:
+                                        st.error(f"Erro: {e}")
+        
+                            # --- GERAÇÃO SEGURA DO HOLERITE ---
+                            try:
+                                func_seguro = f_dict.copy() if 'f_dict' in locals() and isinstance(f_dict, dict) else {}
+                                pag_seguro = {
+                                    'referencia': p_comp if p_comp else (p_data[:7] if 'p_data' in locals() and p_data else ''),
+                                    'valor': p_valor if 'p_valor' in locals() else 0.0,
+                                    'tipo': p_tipo if 'p_tipo' in locals() else '',
+                                    'inss': p_inss if 'p_inss' in locals() else 0.0,
+                                    'faltas': p_faltas if 'p_faltas' in locals() else 0.0,
+                                    'desconto_faltas': p_desc_faltas if 'p_desc_faltas' in locals() else 0.0,
+                                    'data_pagamento': p_data if 'p_data' in locals() else ''
+                                }
+                                
+                                pdf_bytes = gerar_bytes_pdf(dados_func=func_seguro, dados_pag=pag_seguro)
+                                
+                                collab_nome = str(p_collab if 'p_collab' in locals() else 'funcionario').replace(' ', '_')
+                                ref_data = str(p_comp if p_comp else '2026')
+                                nome_arquivo_pdf = f"holerite_{collab_nome}_{ref_data.replace('/', '-')}.pdf"
+                                
+                            except Exception as e_gen:
+                                pdf_bytes = b""
+                                nome_arquivo_pdf = "holerite.pdf"
+                                st.warning(f"Não foi possível gerar o PDF do holerite: {e_gen}")
+    
+                            if pdf_bytes:
+                                idx_unico = str(i) if 'i' in locals() else str(hash(p_data))
+                                
+                                st.download_button(
+                                    label="📥 Descarregar / Imprimir Holerite em PDF",
+                                    data=pdf_bytes,
+                                    file_name=nome_arquivo_pdf,
+                                    mime="application/pdf",
+                                    key=f"btn_baixar_holerite_rh_unico_{idx_unico}_{ref_data}_{p_id}"
+                                )
+                            else:
+                                st.info("ℹ️ Registe ou selecione um lançamento válido para descarregar o holerite.")
+                                
+            with aba_pendentes:
+                st.subheader("📅 Controlo Automático de Salários Pendentes, Vales e Baixa")
+                st.markdown("O sistema calcula automaticamente o restante com base nos vales/haveres dados. Marque como '✅ Pago' para quitar a competência.")
+        
+                try:
+                    df_f = pd.read_sql_query("SELECT * FROM funcionarios", conn)
+                    df_p = pd.read_sql_query("SELECT * FROM pagamentos_funcionarios", conn)
+                except Exception:
+                    df_f = pd.DataFrame()
+                    df_p = pd.DataFrame()
+        
+                if not df_f.empty:
+                    competencias_geradas = []
+                    hoje = datetime.now().date()
+        
+                    for _, func in df_f.iterrows():
+                        nome_func = func.get('nome')
+                        salario_base = float(func.get('salario', 0) or 0)
+                        admissao_str = str(func.get('admissao', ''))
+        
+                        try:
+                            data_adm = datetime.strptime(admissao_str[:10], '%Y-%m-%d').date()
+                        except Exception:
+                            data_adm = hoje
+                
+                        ano_atual, mes_atual = hoje.year, hoje.month
+                        cur_year, cur_month = data_adm.year, data_adm.month
+                        
+                        cur_month += 1
+                        if cur_month > 12:
+                            cur_month = 1
+                            cur_year += 1
+                        
+                        limite_year = ano_atual + (1 if mes_atual == 12 else 0)
+                        limite_month = 1 if mes_atual == 12 else mes_atual + 1
+        
+                        while (cur_year < limite_year) or (cur_year == limite_year and cur_month <= limite_month):
+                            competencia_str = f"01/{cur_month:02d}/{cur_year}"
+                            
+                            total_pago_comp = 0.0
+                            tem_salario_final = False
+                            data_pag_efetuado = "-"
+                            
+                            if not df_p.empty:
+                                pag_func = df_p[df_p['colaborador'] == nome_func]
+                                for _, pag in pag_func.iterrows():
+                                    comp_db = str(pag.get('competencia', ''))
+                                    data_db = str(pag.get('data_pagamento', ''))
+                                    tipo_db = str(pag.get('tipo', ''))
+                                    val_db = float(pag.get('valor', 0.0))
+                                    
+                                    if competencia_str in comp_db or f"{cur_year:04d}-{cur_month:02d}" in data_db:
+                                        total_pago_comp += val_db
+                                        if "Salário" in tipo_db or "Baixa" in tipo_db or val_db >= salario_base * 0.9:
+                                            tem_salario_final = True
+                                        data_pag_str = data_db
+                                        if len(data_pag_str) >= 10:
+                                            dp_partes = data_pag_str[:10].split('-')
+                                            if len(dp_partes) == 3:
+                                                data_pag_efetuado = f"{dp_partes[2]}/{dp_partes[1]}/{dp_partes[0]}"
+
+                            restante_devido = max(0.0, salario_base - total_pago_comp)
+
+                            if cur_year > ano_atual or (cur_year == ano_atual and cur_month > mes_atual):
+                                status_competencia = "🟢 A Vencer"
+                            elif tem_salario_final or restante_devido <= 0.01:
+                                status_competencia = "✅ Pago"
+                            elif total_pago_comp > 0:
+                                status_competencia = "🟡 Parcial (Com Vales/Haveres)"
+                            else:
+                                status_competencia = "🔴 Pendente (Em Aberto)"
+        
+                            competencias_geradas.append({
+                                "Excluir": False,
+                                "Colaborador": nome_func,
+                                "Cargo": func.get('cargo', ''),
+                                "Competência (Mês/Ano)": competencia_str,
+                                "Data do Pagamento": data_pag_efetuado,
+                                "Salário Base (R$)": salario_base,
+                                "Total Pago/Vales (R$)": total_pago_comp,
+                                "Restante (R$)": restante_devido,
+                                "Status": status_competencia
+                            })
+        
+                            cur_month += 1
+                            if cur_month > 12:
+                                cur_month = 1
+                                cur_year += 1
+        
+                    df_pendentes_final = pd.DataFrame(competencias_geradas)
+        
+                    if not df_pendentes_final.empty:
+                        filtro_status = st.selectbox("Filtrar por Status:", ["Todos", "🔴 Pendente (Em Aberto)", "🟡 Parcial (Com Vales/Haveres)", "🟢 A Vencer", "✅ Pago"], key="filtro_status_pend_v10")
+                        if filtro_status != "Todos":
+                            df_pendentes_final = df_pendentes_final[df_pendentes_final['Status'] == filtro_status]
+        
+                        edited_pendentes = st.data_editor(
+                            df_pendentes_final,
+                            key="editor_tabela_salarios_pendentes_v10",
+                            use_container_width=True,
+                            hide_index=True,
+                            column_config={
+                                "Excluir": st.column_config.CheckboxColumn("Excluir", default=False),
+                                "Competência (Mês/Ano)": st.column_config.TextColumn("Competência (Mês/Ano)", disabled=True),
+                                "Data do Pagamento": st.column_config.TextColumn("Data do Pagamento"),
+                                "Salário Base (R$)": st.column_config.NumberColumn("Salário Base (R$)", disabled=True, format="R$ %.2f"),
+                                "Total Pago/Vales (R$)": st.column_config.NumberColumn("Total Pago/Vales (R$)", disabled=True, format="R$ %.2f"),
+                                "Restante (R$)": st.column_config.NumberColumn("Restante (R$)", format="R$ %.2f"),
+                                "Status": st.column_config.SelectboxColumn(
+                                    "Status do Pagamento",
+                                    options=["🔴 Pendente (Em Aberto)", "🟡 Parcial (Com Vales/Haveres)", "🟢 A Vencer", "✅ Pago"],
+                                    required=True
+                                )
+                            },
+                            num_rows="fixed"
+                        )
+        
+                        st.markdown("---")
+                        
+                        if st.button("💾 Salvar Alterações e Dar Baixa nos Salários", key="btn_salvar_pend_v10", use_container_width=True):
+                            try:
+                                cursor = conn.cursor()
+                                with conn:
+                                    for _, row in edited_pendentes.iterrows():
+                                        collab = row['Colaborador']
+                                        comp = row['Competência (Mês/Ano)']
+                                        restante_val = float(row['Restante (R$)'])
+                                        status_mod = row['Status']
+                                        
+                                        parts_comp = comp.split('/')
+                                        if len(parts_comp) == 3:
+                                            _, mes_competencia, ano_competencia = parts_comp
+                                        else:
+                                            mes_competencia, ano_competencia = parts_comp
+                                        
+                                        data_pag_col = str(row.get('Data do Pagamento', '')).strip()
+                                        if data_pag_col and data_pag_col != '-' and len(data_pag_col) == 10:
+                                            d_p = data_pag_col.split('/')
+                                            data_formatada_db = f"{d_p[2]}-{d_p[1]}-{d_p[0]}"
+                                        else:
+                                            data_formatada_db = f"{ano_competencia}-{mes_competencia}-05"
+        
+                                        if "Pago" in status_mod:
+                                            if restante_val > 0.01:
+                                                cursor.execute("""
+                                                    INSERT INTO pagamentos_funcionarios (colaborador, tipo, valor, data_pagamento, competencia)
+                                                    VALUES (?, 'Salário Final', ?, ?, ?)
+                                                """, (collab, restante_val, data_formatada_db, comp))
+        
+                                st.success("✅ Alterações e baixa salarial guardadas com sucesso!")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Erro: {e}")
+                    else:
+                        st.info("ℹ️ Não foram encontradas competências para exibir.")
+                else:
+                    st.info("ℹ️ Registe colaboradores na primeira aba.")
+        elif menu_admin == "📥 Entrada de Estoque (Compras)":
+            st.title("📥 Entrada de Estoque (Compras)")
+            st.subheader("Registrar Entrada de Estoque")
+        
+            if "carrinho_compras" not in st.session_state:
+                st.session_state.carrinho_compras = []
+        
+            produtos_opt = carregar_coluna("produtos", "produto") or ["AMEIXA IMPORTADA", "ABACATE"]
+            fornecedores_opt = carregar_coluna("fornecedores", "fornecedor") or ["BAHIA"]
+            grupos_opt = carregar_coluna("grupos", "grupo") or ["GERAL"]
+        
+            tipo_cadastro = st.radio("Escolha a opção:", ["Produto Existente", "Novo Produto"], horizontal=True, key="radio_tipo_prod")
+        
+            col1, col2 = st.columns(2)
+            with col1:
+                if tipo_cadastro == "Produto Existente":
+                    produto_escolhido = st.selectbox("Selecione o Produto", produtos_opt, key="prod_entrada_estoque")
+                    produto_final = produto_escolhido
+                else:
+                    produto_final = st.text_input("Digite o Nome do NOVO Produto", key="input_novo_produto_compras").strip().upper()
+        
+                fornecedor_escolhido = st.selectbox("Fornecedor", fornecedores_opt, key="forn_entrada")
+                quantidade_entrada = st.number_input("Quantidade", min_value=0.01, value=1.0, step=1.0, key="qtd_entrada")
+        
+            with col2:
+                grupo_escolhido = st.selectbox("Grupo / Categoria", grupos_opt, key="grupo_entrada")
+                preco_compra = st.number_input("Preço de compra Unitário (R$)", min_value=0.0, format="%.2f", key="compra_entrada")
+                preco_venda = st.number_input("Preço de Venda Unitário (R$)", min_value=0.0, format="%.2f", key="venda_entrada")
+        
+            if st.button("🛒 Adicionar ao Carrinho", type="primary"):
+                if not produto_final:
+                    st.error("Por favor, informe ou selecione o produto.")
+                elif quantidade_entrada <= 0:
+                    st.error("A quantidade deve ser maior que zero.")
+                else:
+                    st.session_state.carrinho_compras.append({
+                        "produto": produto_final,
+                        "grupo": grupo_escolhido,
+                        "fornecedor": fornecedor_escolhido,
+                        "quantidade": quantidade_entrada,
+                        "valor_compra": preco_compra,
+                        "valor_venda": preco_venda
+                    })
+                    st.success(f"✅ '{produto_final}' adicionado ao carrinho!")
+                    st.rerun()
+        
+            if st.session_state.carrinho_compras:
+                st.divider()
+                st.subheader("📋 Itens no Carrinho de Entrada")
+                st.caption("💡 **Dica**: Você pode editar os campos direto na tabela ou selecionar a linha e apertar `Delete` para excluir.")
+        
+                df_carrinho = pd.DataFrame(st.session_state.carrinho_compras)
+                df_carrinho_editado = st.data_editor(df_carrinho, use_container_width=True, num_rows="dynamic", key="editor_carrinho_compras")
+        
+                col_salvar_tudo, col_limpar = st.columns([2, 1])
+                with col_salvar_tudo:
+                    if st.button("💾 Finalizar e Salvar Todas as Entradas", type="primary", key="btn_salvar_carrinho_db"):
+                        try:
+                            with conn:
+                                cursor = conn.cursor()
+                                cursor.execute("""
+                                    CREATE TABLE IF NOT EXISTS produtos (
+                                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                        produto TEXT,
+                                        grupo TEXT,
+                                        fornecedor TEXT,
+                                        quantidade REAL DEFAULT 0,
+                                        valor_compra REAL DEFAULT 0,
+                                        valor_venda REAL DEFAULT 0
+                                    )
+                                """)
+        
+                                for _, item in df_carrinho_editado.iterrows():
+                                    cursor.execute("SELECT id FROM produtos WHERE produto = ?", (item['produto'],))
+                                    existe = cursor.fetchone()
+        
+                                    if existe:
+                                        cursor.execute("UPDATE produtos SET quantidade = quantidade + ?, valor_compra = ?, valor_venda = ?, grupo = ?, fornecedor = ? WHERE produto = ?", (item['quantidade'], item['valor_compra'], item['valor_venda'], item['grupo'], item['fornecedor'], item['produto']))
+                                    else:
+                                        cursor.execute("INSERT INTO produtos (produto, grupo, fornecedor, quantidade, valor_compra, valor_venda) VALUES (?, ?, ?, ?, ?, ?)", (item['produto'], item['grupo'], item['fornecedor'], item['quantidade'], item['valor_compra'], item['valor_venda']))
+        
+                            st.session_state.carrinho_compras = []
+                            st.cache_data.clear()
+                            st.success("✅ Todas as entradas foram registradas com sucesso no banco de dados!")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Erro ao salvar compras no banco: {e}")
+        
+                with col_limpar:
+                    if st.button("🗑️ Esvaziar Carrinho"):
+                        st.session_state.carrinho_compras = []
+                        st.rerun()
