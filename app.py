@@ -1548,8 +1548,7 @@ def gerar_pdf_tabela_pedidos(df_pedidos, cliente_nome="Geral"):
         
     pdf_output = pdf.output(dest='S').encode('latin1')
     buffer = BytesIO(pdf_output)
-    return buffer  
-                        with col_b3:
+    return buffer                        with col_b3:
                             try:
                                 df_pdf = df_editado.drop(columns=['Excluir'], errors='ignore')
                                 pdf_buf = gerar_pdf_tabela_pedidos(df_pdf, cliente_nome=f_cli)
