@@ -30,7 +30,11 @@ def gerar_pdf_tabela_pedidos(df_pedidos, cliente_nome="Geral"):
         val = str(row.get('Valor Total', ''))
         pdf.cell(200, 8, txt=f"Cliente: {cli} | Prod: {prod} | Qtd: {qtd} | Total: R$ {val}", ln=True)
         
-    pdf_output = pdf.output(dest='S').encode('latin1')
+    # Gera o PDF diretamente como bytes (sem usar encode)
+    pdf_output = pdf.output(dest='S')
+    if isinstance(pdf_output, str):
+        pdf_output = pdf_output.encode('latin1')
+        
     buffer = BytesIO(pdf_output)
     return buffer
 # -----------------------------------------------------------------------------
