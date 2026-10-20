@@ -170,7 +170,7 @@ def gerar_pdf_tabela_pedidos(df_pedidos, cliente_nome="Geral"):
 # -----------------------------------------------------------------------------
 # CONFIGURAÇÃO DA PÁGINA
 # -----------------------------------------------------------------------------
-st.set_page_config(page_title="CRM Comércio - Rey da Cebola", layout="wide", page_icon="🛍️")
+st.set_page_config(page_title="CRM Comércio - SUPERMERCADO J. REZENDE", layout="wide", page_icon="🛍️")
 
 # =========================================================
 # IDENTIFICADOR ÚNICO POR NAVEGADOR / APARELHO
