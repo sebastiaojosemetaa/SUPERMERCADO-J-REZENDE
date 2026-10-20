@@ -1530,25 +1530,25 @@ elif perfil_selecionado == "🔒 Administração / Vendedor":
                                         st.warning("Nenhum pedido marcado na coluna 'Excluir'.")
                                 except Exception as e:
                                     st.error(f"Erro ao excluir pedido(s): {e}")
-def gerar_pdf_tabela_pedidos(df_pedidos, cliente_nome="Geral"):
-    from io import BytesIO
-    pdf = FPDF()
-    pdf.add_page()
-    pdf.set_font("Arial", 'B', 14)
-    pdf.cell(200, 10, txt=f"Relatorio de Pedidos - {cliente_nome}", ln=True, align="C")
-    pdf.ln(10)
-    pdf.set_font("Arial", size=10)
-    
-    for index, row in df_pedidos.iterrows():
-        cli = str(row.get('cliente', ''))
-        prod = str(row.get('produto', ''))
-        qtd = str(row.get('quantidade', ''))
-        val = str(row.get('Valor Total', ''))
-        pdf.cell(200, 8, txt=f"Cliente: {cli} | Prod: {prod} | Qtd: {qtd} | Total: R$ {val}", ln=True)
+    def gerar_pdf_tabela_pedidos(df_pedidos, cliente_nome="Geral"):
+        from io import BytesIO
+        pdf = FPDF()
+        pdf.add_page()
+        pdf.set_font("Arial", 'B', 14)
+        pdf.cell(200, 10, txt=f"Relatorio de Pedidos - {cliente_nome}", ln=True, align="C")
+        pdf.ln(10)
+        pdf.set_font("Arial", size=10)
         
-    pdf_output = pdf.output(dest='S').encode('latin1')
-    buffer = BytesIO(pdf_output)
-    return buffer                        
+        for index, row in df_pedidos.iterrows():
+            cli = str(row.get('cliente', ''))
+            prod = str(row.get('produto', ''))
+            qtd = str(row.get('quantidade', ''))
+            val = str(row.get('Valor Total', ''))
+            pdf.cell(200, 8, txt=f"Cliente: {cli} | Prod: {prod} | Qtd: {qtd} | Total: R$ {val}", ln=True)
+            
+        pdf_output = pdf.output(dest='S').encode('latin1')
+        buffer = BytesIO(pdf_output)
+        return buffer                        
                         with col_b3:
                             try:
                                 df_pdf = df_editado.drop(columns=['Excluir'], errors='ignore')
