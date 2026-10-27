@@ -252,30 +252,6 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# --- PAINEL LATERAL (DEV) ---
-with st.sidebar.expander("⚙️ Gerador de Chaves (Dev)"):
-    senha_dev = st.text_input("Senha Mestre Dev", type="password", key="pwd_dev_topo")
-    if senha_dev == "13142715":
-        tipo_plano = st.selectbox("Tipo de Chave:", ["Teste (7 Dias)", "Mensal (30 Dias)", "Anual (365 Dias)"], key="select_tipo_plano_dev")
-        doc_cliente = st.text_input("CNPJ ou CPF do Cliente:", key="doc_dev_topo_doc")
-        if st.button("Gerar Chave", key="btn_dev_topo_acao"):
-            if doc_cliente.strip():
-                sufixo_tipo = "TESTE" if "Teste" in tipo_plano else ("MENSAL" if "Mensal" in tipo_plano else "ANUAL")
-                doc_limpo = ''.join(filter(str.isdigit, str(doc_cliente)))
-                hash_hex = hashlib.md5((doc_limpo + "REY_CEBOLA_2026" + sufixo_tipo).encode()).hexdigest().upper()
-                st.code(f"CRM-{sufixo_tipo}-{hash_hex[:4]}-{hash_hex[4:8]}-{hash_hex[8:12]}", language="text")
-                st.success("Chave gerada com sucesso!")
-
-st.sidebar.title("🔑 Acesso ao Sistema")
-st.sidebar.radio("Selecione o Perfil:", ["🔒 Administração / Vendedor"], key="perfil_principal_radio")
-st.sidebar.markdown("---")
-
-if st.session_state.get('dispositivo_ativado', False):
-    st.sidebar.success("🟢 Dispositivo Ativado")
-else:
-    st.sidebar.error("🔴 Dispositivo Não Ativado")
-st.sidebar.markdown("---")
-
 # ==========================================
 # ECRÃ DE LOGIN OU INTERFACE PRINCIPAL
 # ==========================================
