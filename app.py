@@ -14,7 +14,7 @@ import hashlib
 import uuid
 
 # --- CONFIGURAÇÃO DA PÁGINA ---
-st.set_page_config(page_title="CRM Comércio - REY DA CEBOLA", layout="wide", page_icon="🛍️")
+st.set_page_config(page_title="CRM Comércio - SUPERMERCADO-J-REZENDE", layout="wide", page_icon="🛍️")
 
 # --- CONEXÃO E FUNÇÕES DE SUPORTE ---
 def get_connection():
@@ -203,13 +203,13 @@ if df_emp_dev.empty:
     cursor = conn.cursor()
     cursor.execute("""
         INSERT OR IGNORE INTO empresas_dispositivos (device_id, nome_empresa, cnpj, ie, fone, endereco, ativado, dias_licenca)
-        VALUES (?, 'REY DA CEBOLA', '19417439000142', '', '(99) 98501-6050', 'RUA CAIPIRA, Nº 174', 0, 30)
+        VALUES (?, 'SUPERMERCADO-J-REZENDE', '11111111000111', '', '(99) 98501-6050', 'RUA CAIPIRA, Nº 174', 0, 30)
     """, (device_id,))
     conn.commit()
     df_emp_dev = carregar_dados(f"SELECT * FROM empresas_dispositivos WHERE device_id = '{device_id}'")
 
 reg_emp = df_emp_dev.iloc[0] if not df_emp_dev.empty else {}
-nome_empresa_header = str(reg_emp.get('nome_empresa', 'REY DA CEBOLA'))
+nome_empresa_header = str(reg_emp.get('nome_empresa', 'SUPERMERCADO-J-REZENDE'))
 
 dispositivo_esta_ativado = bool(reg_emp.get('ativado', 0) == 1)
 dias_licenca_atual = int(reg_emp.get('dias_licenca', 30))
@@ -984,7 +984,7 @@ else:
                 st.rerun()
         else:
             st.warning("⚠️ Insira a chave de ativação correspondente ao seu CNPJ/CPF para liberar o sistema.")
-            doc_atual = str(reg_emp.get('cnpj', '19417439000142'))
+            doc_atual = str(reg_emp.get('cnpj', '11111111000111'))
             st.info(f"Empresa Atual (CNPJ/CPF): `{doc_atual}`")
 
             chave_digitada = st.text_input("Chave de Ativação:", key="input_chave_ativacao_config")
@@ -1024,8 +1024,8 @@ else:
         st.markdown("---")
         with st.form("form_cfg_emp"):
             st.markdown("### 📝 Dados Gerais da Empresa")
-            nome_emp = st.text_input("Razão Social / Nome Fantasia", value=str(reg_emp.get('nome_empresa', 'REY DA CEBOLA')))
-            cnpj_emp = st.text_input("CNPJ ou CPF", value=str(reg_emp.get('cnpj', '19417439000142')))
+            nome_emp = st.text_input("Razão Social / Nome Fantasia", value=str(reg_emp.get('nome_empresa', 'SUPERMERCADO-J-REZENDE')))
+            cnpj_emp = st.text_input("CNPJ ou CPF", value=str(reg_emp.get('cnpj', '11111111000111')))
             tel_emp = st.text_input("Telefone de Contato", value=str(reg_emp.get('fone', '(99) 98501-6050')))
             end_emp = st.text_input("Endereço Completo", value=str(reg_emp.get('endereco', 'RUA CAIPIRA, Nº 174')))
             
